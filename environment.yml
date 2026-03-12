@@ -1,0 +1,29 @@
+name: aabim
+channels:
+  - conda-forge
+  - ocdb
+dependencies:
+  - python
+  - black
+  - numpy
+  - dask
+  - netCDF4
+  - h5py
+  - gdal
+  - pyproj
+  - pandas
+  - geopandas
+  - tqdm
+  - timezonefinder
+  - pendulum
+  - charset-normalizer
+  - shapely
+  - statsmodels
+  - xarray
+  - zarr
+  - affine
+  - rasterio
+  - pip
+  - scipy
+  - pip:
+    - p_tqdm
