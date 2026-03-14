@@ -1,698 +1,403 @@
-# Standard library imports
-import os
-import time
-import datetime
-import math
+"""
+read_pix.py — WISE .pix to aabim NetCDF converter.
 
-# Third party imports
+The ``Pix`` class reads a WISE hyperspectral image directory in PCIGeomatics
+.pix format and converts it to the aabim CF-1.0 NetCDF format.
+
+Usage
+-----
+>>> pix = Pix("/path/to/ACI-13A.dpix")
+>>> pix.to_aabim_nc("/path/to/ACI13.nc")
+
+Input directory structure
+-------------------------
+*.pix          — radiometric data (GDAL PCIDISK driver)
+*.pix.hdr      — ENVI header
+*.glu          — geolocation LUT (across-track pixel mapping)
+*.glu.hdr      — ENVI header for the glu file
+*Navcor_sum.log — navigation summary (heading, pitch, roll, altitude …)
+"""
+from __future__ import annotations
+
+import datetime
+import logging
+import os
+import re
+import time
+from pathlib import Path
+
+import numpy as np
+import pyproj
 from osgeo import gdal
 from tqdm import tqdm
-import numpy as np
-import re
-import netCDF4
-from p_tqdm import p_uimap
-import xarray as xr
-import zarr
-import numcodecs
-import logging
 
-
-# REVERIE import
-from reverie.image import ReveCube
-from .flightline import FlightLine
-from reverie.utils import helper
-from reverie.image.tile import Tile
-from reverie.utils.cf_aliases import get_cf_std_name
-
-# from reverie.utils.tile import Tile
+from aabim.image.image import Image
+from aabim.image.sensor import Sensor
+from aabim.converter.wise.flightline import FlightLine
+from aabim.utils import helper
 
 gdal.UseExceptions()
+log = logging.getLogger(__name__)
 
 
-class Pix(ReveCube):
-    """
-    This class expand ReveCube() to read the WISE images in .pix format, compute the observation geometry and convert
-     that data to the NetCDF CF reverie format.
+class Pix(Image):
+    """WISE hyperspectral image read from a .pix directory.
 
-    DateCube with extension .pix (PCIGeomatica) cand be read with the GDAL driver PCIDISK
-    They are minimally are composed of two files:
-    * .pix containing the image data
-    * .pix.hdr ENVI header describing the .pix data
+    Extends :class:`~aabim.image.image.Image` with WISE-specific geometry
+    computation (GLU-based view angles) and a converter to the aabim NetCDF
+    format.
 
-    Additionally, geo correction LUT might be present:
-    * .glu contains the geolocation data of the pixels across the track of the plane
-    * .glu.hdr ENVI header describing the .glu data
-
-    Additionnally, navigation files might be present:
-    * -Navcor_sum.log statistical summary of the NAVCOR.log
-    * -NAVCOR.log: full navigation log from the GNSS IMU system
+    Parameters
+    ----------
+    pix_dir : str or Path
+        Path to the ``.dpix`` directory containing the ``.pix``, ``.glu``
+        and navigation files.
     """
 
-    def __init__(self, pix_dir):
+    def __init__(self, pix_dir: str | Path):
         t0 = time.perf_counter()
 
-        if os.path.isdir(pix_dir):
-            self.image_dir = pix_dir
-        else:
-            raise ValueError("pix_dir does not exist")
-
-        self.image_name = os.path.basename(pix_dir).split(".")[0]
-
-        # WISE radiometric data
+        pix_dir = str(pix_dir)
+        if not os.path.isdir(pix_dir):
+            raise ValueError(f"Directory does not exist: {pix_dir}")
 
         files = os.listdir(pix_dir)
 
-        hdr_f = [file for file in files if re.match(r".*\.pix\.hdr", file)][0]
+        # --- ENVI header and .pix file --------------------------------------- #
+        hdr_f = next(f for f in files if re.match(r".*\.pix\.hdr", f))
+        pix_f = next(f for f in files if re.match(r".*\.pix$", f))
         self.hdr_f = os.path.join(pix_dir, hdr_f)
-
-        pix_f = [file for file in files if re.match(r".*\.pix$", file)][0]
         self.pix_f = os.path.join(pix_dir, pix_f)
 
-        if not os.path.isfile(self.hdr_f) or not os.path.isfile(self.pix_f):
-            raise ValueError(f"{self.hdr_f} or {self.pix_f} does not exist")
-
-        self.image_name = [re.findall(r".*(?=-L|-N)", file) for file in files][0][0]
-
-        # Open the .pix file with GDAL
-        self.src_ds = gdal.Open(self.pix_f)
-        logging.info(
-            f"Dataset open with GDAL driver: {self.src_ds.GetDriver().ShortName}"
-        )
-
-        # Parse ENVI header
         self.header = helper.read_envi_hdr(hdr_f=self.hdr_f)
+        log.debug("ENVI header: %s", self.hdr_f)
 
-        self.wavelength = np.array(
+        image_name = re.findall(r".*(?=-L|-N)", pix_f)[0]
+        log.debug("Image name: %s", image_name)
+
+        wavelength = np.array(
             [float(w) for w in self.header["wavelength"].split(",")]
         )
+        log.debug(
+            "Wavelength: %d bands  [%.1f – %.1f nm]",
+            len(wavelength), wavelength.min(), wavelength.max(),
+        )
 
-        # Define time for the image
-        # datetime.strptime("21/11/06T16:30:00Z", "%d/%m/%yT%H:%M:%SZ")
-        self.acq_time_z = datetime.datetime.strptime(
+        acq_time_z = datetime.datetime.strptime(
             self.header["acquisition time"], "%Y-%m-%dT%H:%M:%SZ"
         ).replace(tzinfo=datetime.timezone.utc)
+        log.debug("Acquisition time (UTC): %s", acq_time_z)
 
-        # Define image cube size
-        # self.in_ds.RasterYSize
-        # Vertical axis: lines = rows = height = y
-        # self.in_ds.RasterXSize
-        # Horizontal axis: samples = columns = width = x
-        self.n_rows = int(self.header["lines"])
-        self.n_cols = int(self.header["samples"])
-        self.n_bands = int(self.header["bands"])
+        n_rows = int(self.header["lines"])
+        n_cols = int(self.header["samples"])
+        log.debug("Raster size: %d rows × %d cols", n_rows, n_cols)
 
-        # Define image coordinate from 'map info'
         map_info = self.header["map info"]
-        self.Affine, self.CRS, self.Proj4String = helper.parse_mapinfo(map_info)
-        # Compute projected and geographic coordinates
-        self.cal_coordinate(self.Affine, self.n_rows, self.n_cols)
+        Affine, crs, _ = helper.parse_mapinfo(map_info)
+        log.debug("CRS: EPSG:%s", crs.to_epsg())
 
-        # Define data type, unit, scale factor, offset, and ignore values
-        dtype = int(self.header["data type"])
-        if dtype == 1:
-            self.dtype = np.dtype("uint8")
-        if dtype == 2:
-            self.dtype = np.dtype("int16")
+        y, x = self._compute_yx(Affine, n_rows, n_cols)
 
-        # TODO: how to deal with unit parsing ? Should we at all ? Just ask the user ?
-        self.unit = "uW cm-2 nm-1 sr-1"
-        unit_res = {
-            key: val for key, val in self.header.items() if re.search(f"unit", key)
-        }
-        logging.info(f"Found unit: {unit_res}\nHard coded unit is: {self.unit}")
-        #
-        # if len(res) == 0:
-        #     print("No unit found in the header you should probably: 1. yell of despair and 2. Try your best guess and contact someone :)")
-        # if len(res) > 1:
-        #     print("Multiple unit found")
-
-        # either 'data scale factor' or 'radiance scale factor' can exist in ENVI hdr
-        # self.scale = int(self.Header.metadata['radiance scale factor'])
-        # scale_res = {key: val for key, val in self.header.items() if re.search(f"scale", key)}
-        """
-        scale is used by NetCDF CF in writing and reading
-        Reading: multiply by the scale and add the add_offset
-        Writing: subtract the add_offset and divide by the scale
-        If the scale factor is integer, to properly apply the scale in the writing order we need the
-        reciprocal of it.
-        """
-        scale_factor = [val for key, val in self.header.items() if "scale" in key][0]
-        logging.info(f"Read scale factor as: {scale_factor}")
+        # --- Scale factor ---------------------------------------------------- #
+        scale_raw = [v for k, v in self.header.items() if "scale" in k][0]
         try:
-            scale_factor = int(scale_factor)
-            self.scale_factor = np.reciprocal(float(scale_factor))
-        except ValueError as e:
-            print(e)
-            self.scale_factor = float(scale_factor)
-        logging.info(f"Converted scale factor as: {self.scale_factor}")
-        ignore_value = self.header["data ignore value"]
-        if ignore_value == "":
-            self.no_data = -99999
-        else:
-            self.no_data = int(ignore_value)
+            scale_factor = np.reciprocal(float(int(scale_raw)))
+        except ValueError:
+            scale_factor = float(scale_raw)
+        self.scale_factor = scale_factor
+        log.debug("Scale factor: %g  (raw header value: %s)", scale_factor, scale_raw)
 
-        # Geocorrection Look Up tables
-        # In case Algae-WISE, glu file are named L2C
+        # --- No-data value --------------------------------------------------- #
+        ignore = self.header.get("data ignore value", "")
+        self.no_data = int(ignore) if ignore.strip() else -99999
+        log.debug("No-data value: %d", self.no_data)
 
-        glu_hdr_f = [file for file in files if re.match(r".*\.glu\.hdr$", file)][0]
-        self.glu_hdr_f = os.path.join(pix_dir, glu_hdr_f)
-        glu_f = [file for file in files if re.match(r".*\.glu$", file)][0]
-        self.glu_f = os.path.join(pix_dir, glu_f)
+        # --- Data type ------------------------------------------------------- #
+        dtype_code = int(self.header["data type"])
+        self.dtype = {1: np.dtype("uint8"), 2: np.dtype("int16")}.get(
+            dtype_code, np.dtype("float32")
+        )
+        log.debug("Data type: %s  (ENVI code %d)", self.dtype, dtype_code)
 
-        # Navigation data: altitude, heading, pitch, roll, speed
-        nav_f = [file for file in files if re.match(r".*Navcor_sum\.log$", file)][0]
-        self.nav_f = os.path.join(pix_dir, nav_f)
+        # --- GDAL dataset ---------------------------------------------------- #
+        self.src_ds = gdal.Open(self.pix_f)
+        log.info("GDAL driver: %s  |  %s", self.src_ds.GetDriver().ShortName, self.pix_f)
 
-        if (
-            not os.path.isfile(self.glu_hdr_f)
-            or not os.path.isfile(self.glu_f)
-            or not os.path.isfile(self.nav_f)
-        ):
-            logging.warning(
-                "Navigation data or geo correction missing, cannot compute viewing geometry."
-            )
-            self.flightline = None
-            self.glu_f = None
-            self.glu_hdr_f = None
-
-        else:
+        # --- GLU + navigation ------------------------------------------------ #
+        try:
+            glu_hdr_f = next(f for f in files if re.match(r".*\.glu\.hdr$", f))
+            glu_f     = next(f for f in files if re.match(r".*\.glu$", f))
+            nav_f     = next(f for f in files if re.match(r".*Navcor_sum\.log$", f))
+            self.glu_hdr_f = os.path.join(pix_dir, glu_hdr_f)
+            self.glu_f     = os.path.join(pix_dir, glu_f)
+            self.nav_f     = os.path.join(pix_dir, nav_f)
+            log.debug("GLU file: %s", self.glu_f)
+            log.debug("Navigation log: %s", self.nav_f)
             self.flightline = FlightLine.from_wise_file(
                 nav_sum_log=self.nav_f, glu_hdr=self.glu_hdr_f
             )
-            self.z = self.flightline.height
+            sensor_z = self.flightline.height
+            log.debug(
+                "Flight line: %d samples × %d lines  altitude=%.1f m",
+                self.flightline.samples, self.flightline.lines, sensor_z,
+            )
+        except StopIteration:
+            log.warning("GLU / navigation files not found — view geometry unavailable.")
+            self.glu_f = self.glu_hdr_f = self.nav_f = None
+            self.flightline = None
+            sensor_z = 0.0
 
+        # --- Initialise base Image ------------------------------------------- #
+        import xarray as xr
         super().__init__(
             in_path=self.pix_f,
-            in_ds=self.src_ds,
-            image_name=self.image_name,
-            wavelength=self.wavelength,
-            acq_time_z=self.acq_time_z,
-            z=self.z,
-            y=self.y,
-            x=self.x,
-            n_rows=self.n_rows,
-            n_cols=self.n_cols,
-            Affine=self.Affine,
-            crs=self.CRS,
+            in_ds=xr.Dataset(),          # populated later by to_aabim_nc
+            image_name=image_name,
+            wavelength=wavelength,
+            acq_time_z=acq_time_z,
+            z=sensor_z,
+            y=y,
+            x=x,
+            n_rows=n_rows,
+            n_cols=n_cols,
+            Affine=Affine,
+            crs=crs,
+            level="L1",
         )
+        # Image.__init__ resets no_data to None — restore the value we parsed above
+        self.no_data = int(ignore) if ignore.strip() else -99999
+        self.sensor = Sensor(name="WISE", wavelengths=wavelength)
 
+        # --- Geometry -------------------------------------------------------- #
+        log.debug("Computing sun geometry …")
         self.expand_coordinate()
-
         self.cal_time(self.center_lon, self.center_lat)
-
-        # Other instance attribute that need to be instanced before population by methods
-        # self.valid_mask = None
-
         self.cal_sun_geom()
-
-        self.cal_view_geom()
-
-        self.cal_relative_azimuth()
-        t1 = time.perf_counter()
-
-        logging.info(
-            f"ReveCube initiated from class {self.__class__.__name__} in {t1-t0:.2f}s"
+        log.debug(
+            "Sun zenith: %.1f – %.1f °",
+            float(np.nanmin(self.sun_zenith)), float(np.nanmax(self.sun_zenith)),
         )
+        self.cal_view_geom()
+        self.cal_relative_azimuth()
+
+        log.info("Pix initialised in %.2f s", time.perf_counter() - t0)
+
+    # ---------------------------------------------------------------------- #
+    # Geometry                                                                #
+    # ---------------------------------------------------------------------- #
+
+    def cal_valid_mask(self):
+        """Compute valid mask from GDAL when in_ds is empty, else delegate to Image."""
+        if self.valid_mask is not None:
+            return self.valid_mask
+        if self.in_ds.data_vars:
+            super().cal_valid_mask()
+            return self.valid_mask
+        # in_ds not yet populated (called during __init__): read first band from GDAL
+        data = self.src_ds.GetRasterBand(1).ReadAsArray()
+        self.valid_mask = data != self.no_data
+        log.debug("Valid mask: %d / %d px", self.valid_mask.sum(), self.valid_mask.size)
+        return self.valid_mask
+
+    @staticmethod
+    def _compute_yx(affine, n_rows: int, n_cols: int):
+        """Return projected y and x coordinate arrays from an Affine transform."""
+        cols = np.arange(n_cols)
+        rows = np.arange(n_rows)
+        x = affine.c + cols * affine.a
+        y = affine.f + rows * affine.e
+        return y, x
 
     def cal_view_geom(self):
-        """
-        extract viewing zenith angle
-        the orginal data from the flight line is not georeferenced, and the nrows and ncols are not the same as the georeferenced ones
-        so, we need to transfer the original viewing geometry to the georefernce grid using the georeference LUT
-        :return:
-        """
-        logging.debug("Calculating viewing geometry from glu files")
-
+        """Compute per-pixel view zenith/azimuth from the geolocation LUT."""
         if self.flightline is None:
-            raise Exception("no flight line found")
+            log.warning("No flight line — skipping view geometry.")
+            self.view_zenith = np.full((self.n_rows, self.n_cols), np.nan)
+            self.view_azimuth = np.full((self.n_rows, self.n_cols), np.nan)
+            self.sample_index = np.full((self.n_rows, self.n_cols), np.nan)
+            self.line_index   = np.full((self.n_rows, self.n_cols), np.nan)
+            return
 
-        glu_data = None
-        if self.glu_f is not None:
-            glu_data = gdal.Open(self.glu_f)
-            nchannels, nsamples_glu, nlines_glu = (
-                glu_data.RasterCount,
-                glu_data.RasterXSize,
-                glu_data.RasterYSize,
-            )
-            # WISEMan glu file has three channels but not AlgaeWISE
-            # However, the first two channels are the same
-            # if nchannels != 3:
-            #     raise Exception("the glu file does not have three channels")
-            if (
-                nsamples_glu != self.flightline.samples
-                or nlines_glu != self.flightline.lines
-            ):
-                raise Exception("samples or lines of flightline and glu do not match")
+        glu_data = gdal.Open(self.glu_f)
+        nsamples_glu = glu_data.RasterXSize
+        nlines_glu   = glu_data.RasterYSize
+        if nsamples_glu != self.flightline.samples or nlines_glu != self.flightline.lines:
+            raise ValueError("GLU dimensions do not match flight line.")
 
-        # data_glu =  glu_data.ReadAsArray()
-
-        band_x, band_y = glu_data.GetRasterBand(1), glu_data.GetRasterBand(2)
-        x_glu, y_glu = band_x.ReadAsArray(), band_y.ReadAsArray()
+        x_glu = glu_data.GetRasterBand(1).ReadAsArray()
+        y_glu = glu_data.GetRasterBand(2).ReadAsArray()
 
         v_zenith_fl, v_azimuth_fl = self.flightline.cal_view_geom()
-        # v_zenith_fl, v_azimuth_fl = v_zenith_fl.flatten(), v_azimuth_fl.flatten()
 
-        ## initialize viewing zenith and azimuth with default values
-        v_zenith_level1 = np.full((self.n_rows, self.n_cols), np.nan)
-        v_azimuth_level1 = np.full((self.n_rows, self.n_cols), np.nan)
-        # Initialize the sample position on spatial dimension of the imaging spectrometer array
-        v_sample_array = np.full((self.n_rows, self.n_cols), np.nan)
-        v_line_array = np.full((self.n_rows, self.n_cols), np.nan)
+        v_zenith  = np.full((self.n_rows, self.n_cols), np.nan)
+        v_azimuth = np.full((self.n_rows, self.n_cols), np.nan)
+        v_sample  = np.full((self.n_rows, self.n_cols), np.nan)
+        v_line    = np.full((self.n_rows, self.n_cols), np.nan)
 
-        # TODO: use multiprocessing here, and probably change the name row for line, it is confusing
         for row in tqdm(range(self.flightline.lines), desc="Processing GLU"):
             xs, ys = x_glu[row], y_glu[row]
-            # print(xs,ys)
             rows_c, cols_c = helper.transform_rowcol(
                 self.Affine, xs=xs, ys=ys, precision=5
             )
             mask = (rows_c < self.n_rows) & (cols_c < self.n_cols)
-            # print(np.max(rows_c),np.max(cols_c))
-            rows_c = rows_c[mask]
-            cols_c = cols_c[mask]
+            rows_c, cols_c = rows_c[mask], cols_c[mask]
 
-            v_zenith_level1[rows_c, cols_c] = v_zenith_fl[row][mask]
-            v_azimuth_level1[rows_c, cols_c] = v_azimuth_fl[row][mask]
+            v_zenith[rows_c, cols_c]  = v_zenith_fl[row][mask]
+            v_azimuth[rows_c, cols_c] = v_azimuth_fl[row][mask]
+            v_sample[rows_c, cols_c]  = np.arange(self.flightline.samples)[mask]
+            v_line[rows_c, cols_c]    = row
 
-            # Across-track samples position on the spatial dimension of the imaging spectrometer array
-            v_sample_array[rows_c, cols_c] = np.arange(0, self.flightline.samples)[mask]
+        self.view_zenith  = helper.fill_na_2d(v_zenith)
+        self.view_azimuth = helper.fill_na_2d(v_azimuth)
+        self.sample_index = helper.fill_na_2d(v_sample)
+        self.line_index   = helper.fill_na_2d(v_line)
 
-            # Line index for across-track selection of the imaging spectrometer array spatial dimension
-            v_line_array[rows_c, cols_c] = row
+        valid = self.cal_valid_mask()
+        for arr in [self.view_zenith, self.view_azimuth,
+                    self.sample_index, self.line_index]:
+            arr[~valid] = np.nan
 
-        self.view_zenith = helper.fill_na_2d(v_zenith_level1)
-        self.view_azimuth = helper.fill_na_2d(v_azimuth_level1)
-        self.sample_index = helper.fill_na_2d(v_sample_array)
-        self.line_index = helper.fill_na_2d(v_line_array)
-
-        self.view_zenith[~self.get_valid_mask()] = np.nan
-        self.view_azimuth[~self.get_valid_mask()] = np.nan
-        self.sample_index[~self.get_valid_mask()] = np.nan
-        self.line_index[~self.get_valid_mask()] = np.nan
-
-    def read_band(self, bandindex, tile: Tile = None):
-        """
-        read DN for a given band
-        :param bandindex: bandindex starts with 0
-        :param tile: an instance of the Tile class used for tiled processing
-        :return: re
-        """
-
-        band_temp = self.src_ds.GetRasterBand(bandindex + 1)
-        if tile:
-            radiance_at_sensor = band_temp.ReadAsArray(
-                xoff=tile[2], yoff=tile[0], win_xsize=tile.xsize, win_ysize=tile.ysize
+    def read_band(self, bandindex: int, tile=None):
+        """Read digital numbers for band *bandindex* (0-based)."""
+        band = self.src_ds.GetRasterBand(bandindex + 1)
+        if tile is not None:
+            return band.ReadAsArray(
+                xoff=tile[2], yoff=tile[0],
+                win_xsize=tile.xsize, win_ysize=tile.ysize,
             )
-        else:
-            radiance_at_sensor = band_temp.ReadAsArray()
+        return band.ReadAsArray()
 
-        return radiance_at_sensor
+    # ---------------------------------------------------------------------- #
+    # Crop                                                                    #
+    # ---------------------------------------------------------------------- #
 
-    def get_valid_mask(self, tile: Tile = None):
-        """
-        Get the valid mask for the enire image or a specific tile
-        :param tile: an object of class tile.Tile()
-        :return:
-        """
-        if self.valid_mask is None:
-            self.cal_valid_mask()
-        if tile is None:
-            return self.valid_mask
-        else:
-            return self.valid_mask[tile.sline: tile.eline, tile.spixl: tile.epixl]
+    def crop(self, bbox: dict) -> "Pix":
+        """Crop the image in place to a lat/lon bounding box.
 
-    def cal_valid_mask(self):
-        """
-        Calculate the mask of valid pixel for the entire image (!= nodata)
-        :return: valid_mask
-        """
-        if self.valid_mask is None:
-            # TODO: Problem when the band read is flagged in bbl (bad band list),
-            #   the mask contains only False. Should filter out the bbl bands.
-            iband = 10
-            radiance_at_sensor = self.read_band(iband)
-            self.valid_mask = radiance_at_sensor > 0
+        Must be called **before** :meth:`to_aabim_nc`.  The crop window is
+        stored internally and applied lazily when GDAL bands are read during
+        conversion, so no full-image data is ever loaded into memory.
 
-    def to_reve_nc(self, out_file: str = None):
-        """
-        Convert the Pix() object to reve NetCDF CF format
-        :return:
-        """
+        Parameters
+        ----------
+        bbox : dict
+            ``{"lon": (west, east), "lat": (south, north)}``
 
+        Returns
+        -------
+        self
+        """
+        transformer = pyproj.Transformer.from_crs(4326, self.CRS, always_xy=True)
+        x_west, y_south = transformer.transform(bbox["lon"][0], bbox["lat"][0])
+        x_east, y_north = transformer.transform(bbox["lon"][1], bbox["lat"][1])
+
+        # x ascending, y descending (north-up raster)
+        col_idx = np.where((self.x >= x_west) & (self.x <= x_east))[0]
+        row_idx = np.where((self.y >= y_south) & (self.y <= y_north))[0]
+
+        if col_idx.size == 0 or row_idx.size == 0:
+            raise ValueError("Bounding box does not overlap the image extent.")
+
+        col_start, col_stop = int(col_idx[0]),  int(col_idx[-1]) + 1
+        row_start, row_stop = int(row_idx[0]),  int(row_idx[-1]) + 1
+
+        # Store window for GDAL reads in to_aabim_nc()
+        self._gdal_window = (row_start, col_start,
+                             col_stop - col_start, row_stop - row_start)
+        log.debug(
+            "GDAL window: row_off=%d  col_off=%d  win_x=%d  win_y=%d",
+            *self._gdal_window,
+        )
+
+        # Slice geometry arrays (already in memory)
+        for attr in ("sun_zenith", "sun_azimuth", "view_zenith", "view_azimuth",
+                     "relative_azimuth", "sample_index", "line_index", "valid_mask"):
+            arr = getattr(self, attr, None)
+            if arr is not None:
+                setattr(self, attr, arr[row_start:row_stop, col_start:col_stop])
+
+        # Update spatial attributes
+        self.x      = self.x[col_start:col_stop]
+        self.y      = self.y[row_start:row_stop]
+        self.n_cols = len(self.x)
+        self.n_rows = len(self.y)
+
+        log.info(
+            "Cropped to bbox %s → %d rows × %d cols", bbox, self.n_rows, self.n_cols
+        )
+        return self
+
+    # ---------------------------------------------------------------------- #
+    # Converter                                                               #
+    # ---------------------------------------------------------------------- #
+
+    def to_aabim_nc(self, out_path: str | None = None) -> None:
+        """Write the image to the aabim CF-1.0 NetCDF format.
+
+        Parameters
+        ----------
+        out_path : str, optional
+            Output file path.  Defaults to replacing the ``.dpix`` directory
+            extension with ``.nc``.
+        """
         t0 = time.perf_counter()
 
-        if out_file is None:
-            out_file = self.image_dir.replace(".dpix", ".nc")
+        if out_path is None:
+            out_path = re.sub(r"\.dpix$", ".nc", self.pix_f)
 
-        # Create NetCDF file
-        self.create_reve_nc(out_file)
+        gdal_win = getattr(self, "_gdal_window", None)  # (row_off, col_off, win_x, win_y)
+        if gdal_win is not None:
+            log.debug(
+                "Writing cropped output: %d rows × %d cols  window=%s",
+                self.n_rows, self.n_cols, gdal_win,
+            )
+        else:
+            log.debug("Writing full image: %d rows × %d cols", self.n_rows, self.n_cols)
+        log.debug("Output path: %s", out_path)
 
-        # Create radiometric variable
+        self.create_reve_nc(out_path)
+
+        # Radiance
         self.create_var_nc(
             name="radiance_at_sensor",
             type="i4",
-            dims=(
-                "wavelength",
-                "y",
-                "x",
-            ),
+            dims=("wavelength", "y", "x"),
             scale=self.scale_factor,
         )
+        self.out_ds.variables["radiance_at_sensor"].bad_band_list = (
+            self.header["bbl"].split(",  ")
+        )
+        self.out_ds.variables["radiance_at_sensor"].units = "uW cm-2 nm-1 sr-1"
 
-        # Add optional bad_band_list to the variable attributes
-        self.out_ds.variables["radiance_at_sensor"].bad_band_list = self.header['bbl'].split(",  ")
-
-        # self.n_bands = 1
-        for band in tqdm(range(0, self.n_bands, 1), desc="Writing band: "):
-            # GDAL use 1 base index
-            # Reading from GDAL can be realy slow
-            data = self.src_ds.GetRasterBand(band + 1)
-            data = data.ReadAsArray()
+        for band in tqdm(range(len(self.wavelength)), desc="Writing radiance"):
+            gdal_band = self.src_ds.GetRasterBand(band + 1)
+            if gdal_win is not None:
+                row_off, col_off, win_x, win_y = gdal_win
+                data = gdal_band.ReadAsArray(
+                    xoff=col_off, yoff=row_off, win_xsize=win_x, win_ysize=win_y
+                ).astype(float)
+            else:
+                data = gdal_band.ReadAsArray().astype(float)
             data = data * self.scale_factor
-
-            # Assign missing value
-            """
-            scale is used by NetCDF CF in writing and reading
-            Reading: multiply by the scale and add the add_offset
-            Writing: subtract the add_offset and divide by the scale
-            If the scale factor is integer, to properly apply the scale in the writing order we need the
-            reciprocal of it.
-            """
             data[data == 0] = self.no_data * self.scale_factor
-
             self.out_ds.variables["radiance_at_sensor"][band, :, :] = data
+        log.debug("Radiance written: %d bands", len(self.wavelength))
 
-        # Create geometric variables
-        geom = {
-            "sun_azimuth": self.sun_azimuth,
-            "sun_zenith": self.sun_zenith,
-            "view_azimuth": self.view_azimuth,
-            "view_zenith": self.view_zenith,
+        # Geometry
+        geom_vars = {
+            "sun_azimuth":      self.sun_azimuth,
+            "sun_zenith":       self.sun_zenith,
+            "view_azimuth":     self.view_azimuth,
+            "view_zenith":      self.view_zenith,
             "relative_azimuth": self.relative_azimuth,
-            "sample_index": self.sample_index,
-            "line_index": self.line_index,
+            "sample_index":     self.sample_index,
+            "line_index":       self.line_index,
         }
-
-        for var in tqdm(geom, desc="Writing geometry"):
-            self.create_var_nc(
-                name=var,
-                type="i4",
-                dims=(
-                    "y",
-                    "x",
-                ),
-                scale=self.scale_factor,
-            )
-            data = geom[var]
-
+        for var, data in tqdm(geom_vars.items(), desc="Writing geometry"):
+            self.create_var_nc(name=var, type="i4", dims=("y", "x"),
+                               scale=self.scale_factor)
             np.nan_to_num(data, copy=False, nan=self.no_data * self.scale_factor)
-
             self.out_ds.variables[var][:, :] = data
 
         self.out_ds.close()
-        t1 = time.perf_counter()
-
-        print(f"Exported {self.__class__.__name__} to REVE.nc in {t1-t0:.2f}s")
-        return
-
-    def to_zarr(self, out_store: str = None):
-        t0 = time.perf_counter()
-
-        if out_store is None:
-            raise Exception("out_store not set, cannot create dataset")
-
-        try:
-            store = zarr.DirectoryStore(out_store)
-        except Exception as e:
-            print(e)
-            return
-
-        root_grp = zarr.group(store, overwrite=True)
-
-        # grid_mapping
-        crs = self.CRS
-        logging.info("Detected EPSG:" + str(crs.to_epsg()))
-
-        # For GDAL
-        # https://gdal.org/drivers/raster/zarr.html
-        root_grp.attrs["_CRS"] = {
-            "url": "http://www.opengis.net/def/crs/EPSG/0/" + str(crs.to_epsg()),
-            "wkt": crs.to_wkt(),
-        }
-
-        root_grp.attrs["Conventions"] = "CF-1.0"
-        root_grp.attrs["title"] = "Remote sensing image written by REVERIE"
-        root_grp.attrs[
-            "history"
-        ] = "File created on " + datetime.datetime.utcnow().strftime(
-            "%Y-%m-%d %H:%M:%SZ"
-        )
-        root_grp.attrs["institution"] = "AquaTel UQAR"
-        root_grp.attrs["source"] = "Remote sensing imagery"
-        root_grp.attrs["version"] = "0.1.0"
-        root_grp.attrs["references"] = "https://github.com/raphidoc/reverie"
-        root_grp.attrs[
-            "comment"
-        ] = "Reflectance Extraction and Validation for Environmental Remote Imaging Exploration"
-
-        w = root_grp.create_dataset(
-            "wavelength",
-            shape=(len(self.wavelength)),
-            chunks=(len(self.wavelength)),
-            dtype="f4",
-            compressor=zarr.Zlib(level=1),
-        )
-        # _ARRAY_DIMENSIONS is xarray had hoc attribute
-        # to store the dimension following netCDF CF convention
-        w.attrs["_ARRAY_DIMENSIONS"] = ["wavelength"]
-        w.attrs["units"] = "nm"
-        w.attrs["standard_name"] = "radiation_wavelength"
-        w.attrs["long_name"] = "Central wavelengths of the sensor bands"
-        w.attrs["axis"] = "wavelength"
-        w[:] = self.wavelength
-
-        t = root_grp.create_dataset(
-            "time",
-            shape=(len([self.acq_time_z])),
-            chunks=(len([self.acq_time_z])),
-            dtype="f4",
-            compressor=zarr.Zlib(level=1),
-        )
-        t.attrs["_ARRAY_DIMENSIONS"] = ["time"]
-        t.attrs["units"] = "seconds since 1970-01-01 00:00:00 +00:00"
-        t.attrs["standard_name"] = "time"
-        t.attrs["long_name"] = "UTC acquisition time of remote sensing image"
-        t[:] = self.acq_time_z.timestamp()
-
-        z = root_grp.create_dataset(
-            "z",
-            shape=(len([self.z])),
-            chunks=(len([self.z])),
-            dtype="f4",
-            compressor=zarr.Zlib(level=1),
-        )
-        z.attrs["_ARRAY_DIMENSIONS"] = ["z"]
-        z.attrs["units"] = "m"
-        z.attrs["standard_name"] = "altitude"
-        z.attrs[
-            "long_name"
-        ] = "Altitude is the viewing height above the geoid, positive upward"
-        z[:] = self.z
-
-        y = root_grp.create_dataset(
-            "y",
-            shape=(len(self.y)),
-            chunks=(len(self.y)),
-            dtype="f4",
-            compressor=zarr.Zlib(level=1),
-        )
-        y.attrs["_ARRAY_DIMENSIONS"] = ["y"]
-        y.attrs["units"] = "m"
-        y.attrs["standard_name"] = "projection_y_coordinate"
-        y.attrs["long_name"] = "y-coordinate in projected coordinate system"
-        y.attrs["axis"] = "y"
-        y[:] = self.y
-
-        lat = root_grp.create_dataset(
-            "lat",
-            shape=(len(self.y)),
-            chunks=(len(self.y)),
-            dtype="f4",
-            compressor=zarr.Zlib(level=1),
-        )
-        lat.attrs["_ARRAY_DIMENSIONS"] = ["y"]
-        lat.attrs["units"] = "degrees_north"
-        lat.attrs["standard_name"] = "latitude"
-        lat[:] = self.lat
-
-        x = root_grp.create_dataset(
-            "x",
-            shape=(len(self.x)),
-            chunks=(len(self.x)),
-            dtype="f4",
-            compressor=zarr.Zlib(level=1),
-        )
-        x.attrs["_ARRAY_DIMENSIONS"] = ["x"]
-        x.attrs["units"] = "m"
-        x.attrs["standard_name"] = "projection_x_coordinate"
-        x.attrs["long_name"] = "x-coordinate in projected coordinate system"
-        x.attrs["axis"] = "x"
-        x[:] = self.x
-
-        lon = root_grp.create_dataset(
-            "lon",
-            shape=(len(self.x)),
-            chunks=(len(self.x)),
-            dtype="f4",
-            compressor=zarr.Zlib(level=1),
-        )
-        lon.attrs["_ARRAY_DIMENSIONS"] = ["x"]
-        lon.attrs["units"] = "degrees_east"
-        lon.attrs["standard_name"] = "longitude"
-        lon[:] = self.lon
-
-        grid_mapping = root_grp.create_dataset(
-            "grid_mapping",
-            shape=(),
-            chunks=(),
-            dtype="i4",
-        )
-
-        # For xarray:
-        # the grid_mapping variable MUST have the _ARRAY_DIMENSIONS attribute even if it is empty
-        grid_mapping.attrs["_ARRAY_DIMENSIONS"] = []
-
-        # Maybe not necessary but it follows the CF convention
-        cf_grid_mapping = crs.to_cf()
-
-        grid_mapping.attrs["crs_wkt"] = cf_grid_mapping["crs_wkt"]
-        grid_mapping.attrs["semi_major_axis"] = cf_grid_mapping["semi_major_axis"]
-        grid_mapping.attrs["semi_minor_axis"] = cf_grid_mapping["semi_minor_axis"]
-        grid_mapping.attrs["inverse_flattening"] = cf_grid_mapping["inverse_flattening"]
-        grid_mapping.attrs["reference_ellipsoid_name"] = cf_grid_mapping[
-            "reference_ellipsoid_name"
-        ]
-        grid_mapping.attrs["longitude_of_prime_meridian"] = cf_grid_mapping[
-            "longitude_of_prime_meridian"
-        ]
-        grid_mapping.attrs["prime_meridian_name"] = cf_grid_mapping[
-            "prime_meridian_name"
-        ]
-        grid_mapping.attrs["geographic_crs_name"] = cf_grid_mapping[
-            "geographic_crs_name"
-        ]
-        grid_mapping.attrs["horizontal_datum_name"] = cf_grid_mapping[
-            "horizontal_datum_name"
-        ]
-        grid_mapping.attrs["projected_crs_name"] = cf_grid_mapping["projected_crs_name"]
-        grid_mapping.attrs["grid_mapping_name"] = cf_grid_mapping["grid_mapping_name"]
-        grid_mapping.attrs["latitude_of_projection_origin"] = cf_grid_mapping[
-            "latitude_of_projection_origin"
-        ]
-        grid_mapping.attrs["longitude_of_central_meridian"] = cf_grid_mapping[
-            "longitude_of_central_meridian"
-        ]
-        grid_mapping.attrs["false_easting"] = cf_grid_mapping["false_easting"]
-        grid_mapping.attrs["false_northing"] = cf_grid_mapping["false_northing"]
-        grid_mapping.attrs["scale_factor_at_central_meridian"] = cf_grid_mapping[
-            "scale_factor_at_central_meridian"
-        ]
-
-        # self.no_data = netCDF4.default_fillvals[type]
-        # When scaling the default _FillValue, get somehow messed up when reading with GDAL
-        self.no_data = math.trunc(netCDF4.default_fillvals["i4"] / 1000)
-
-        # filters = [numcodecs.Delta(dtype="i4")]
-        compressor = numcodecs.Blosc(
-            cname="zstd", clevel=3, shuffle=numcodecs.Blosc.SHUFFLE
-        )
-        # filters have to be an iterable, in case multiple filters are applied
-        filters = [numcodecs.Quantize(digits=3, dtype="f4")]
-        # TODO, cannot make filters work properly
-        #  https://zarr.readthedocs.io/en/stable/spec/v2.html#filters
-        filters = [zarr.codecs.FixedScaleOffset(0, 1000, "f4")]
-
-        # Create radiometric variable
-        # chunk size is set to 1 wavelength to allow for parallel computation and I/O
-        # size along the spatial dims should be optimized for the available memory
-        radiance_at_sensor = root_grp.create(
-            "radiance_at_sensor",
-            shape=(self.n_bands, self.n_rows, self.n_cols),
-            chunks=(1, 500, 500),
-            dtype="<f4",
-            fill_value=self.no_data,
-            # filters=filters,
-            compressor=compressor,
-        )
-
-        radiance_at_sensor.attrs["_ARRAY_DIMENSIONS"] = ["wavelength", "y", "x"]
-
-        radiance_at_sensor.attrs["grid_mapping"] = "grid_mapping"  # self.proj_var.name
-        radiance_at_sensor.attrs["_CRS"] = {
-            "url": "http://www.opengis.net/def/crs/EPSG/0/" + str(crs.to_epsg()),
-            "wkt": crs.to_wkt(),
-        }
-
-        # Follow the standard name table CF convention
-        std_name, std_unit = get_cf_std_name(alias="radiance_at_sensor")
-        radiance_at_sensor.attrs["units"] = std_unit
-        radiance_at_sensor.attrs["standard_name"] = std_name
-
-        # self.n_bands = 1
-        for band in tqdm(range(0, self.n_bands, 1), desc="Writing band: "):
-            # GDAL use 1 base index
-            # Reading from GDAL can be really slow, would be nice to be able to parallelize this
-            data = self.src_ds.GetRasterBand(band + 1)
-            data = data.ReadAsArray()
-            data = data * self.scale_factor
-
-            data[data == 0] = np.nan  # self.no_data
-
-            # filters[0].encode(data).max()
-
-            radiance_at_sensor[
-                band, :, :
-            ] = data  # filters[0].encode(data).reshape(self.n_rows, self.n_cols)
-
-        # GDAL doesn't seem to be able to read the the spectral data (wavelength, y, y)
-        # when just spatial data is also present (y, x)
-        # Create geometric variables
-        geom = {
-            "sun_azimuth": self.sun_azimuth,
-            "sun_zenith": self.sun_zenith,
-            "view_azimuth": self.view_azimuth,
-            "view_zenith": self.view_zenith,
-            "relative_azimuth": self.relative_azimuth,
-            "sample_index": self.sample_index,
-            "line_index": self.line_index,
-        }
-
-        for var in tqdm(geom, desc="Writing geometry"):
-            array_zarr = root_grp.create(
-                var,
-                shape=(self.n_rows, self.n_cols),
-                chunks=(500, 500),
-                dtype="f4",
-                fill_value=self.no_data,
-                # filters=filters,
-                compressor=compressor,
-            )
-
-            array_zarr.attrs["_ARRAY_DIMENSIONS"] = ["y", "x"]
-
-            array_zarr.attrs["_CRS"] = {
-                "url": "http://www.opengis.net/def/crs/EPSG/0/" + str(crs.to_epsg()),
-                "wkt": crs.to_wkt(),
-            }
-
-            data = geom[var]
-
-            array_zarr[:, :] = data
-
-        # Write consolidated metadata
-        zarr.convenience.consolidate_metadata(store, metadata_key=".zmetadata")
-
-        t1 = time.perf_counter()
-
-        print(f"Exported {self.__class__.__name__} to Zarr in {t1-t0:.2f}s")
-        # No need to close the store, it is never really opened
+        log.info("Pix → aabim NetCDF in %.2f s: %s", time.perf_counter() - t0, out_path)

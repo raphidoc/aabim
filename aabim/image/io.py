@@ -1,3 +1,23 @@
+import datetime
+import math
+import os
+
+
+import xarray as xr
+
+import pyproj
+import affine
+import netCDF4
+import logging
+import numpy as np
+
+import zarr
+
+from aabim.utils.cf_aliases import get_cf_std_name
+
+log = logging.getLogger(__name__)
+
+
 class IOMixin:
 
     @classmethod
@@ -345,6 +365,16 @@ class IOMixin:
         data_var.scale_factor = scale
         data_var.add_offset = 0
 
+    def to_netcdf(self, path: str) -> None:
+        """Save the current image dataset to a CF-compliant NetCDF file.
+
+        Parameters
+        ----------
+        path : str
+            Output file path (``*.nc``).
+        """
+        self.in_ds.to_netcdf(path)
+
     def to_reve_nc(self):
         """
         TODO : Wrapper for create_dataset_nc, create_var_nc, write_var_nc, close_nc ?
@@ -353,15 +383,86 @@ class IOMixin:
         """
         pass
 
-    def to_zarr(self, out_store: str = None):
-        if out_store is None:
-            raise Exception("out_path file not set, cannot create dataset")
+    def to_zarr(self, out_store: str, consolidated: bool = True) -> None:
+        """Write the image dataset to a CF-compliant, GDAL-readable Zarr store.
 
-        try:
-            store = zarr.DirectoryStore("data/example.zarr")
-        except Exception as e:
-            print(e)
-            return
+        CRS and georeferencing are encoded via the CF *grid_mapping* convention:
+        a scalar variable ``spatial_ref`` carries ``crs_wkt``, ``spatial_ref``,
+        and ``GeoTransform`` attributes.  GDAL ≥ 3.4 and QGIS read this
+        natively through the Zarr driver.  The approach is forward-compatible
+        with the emerging GeoZarr spec (which is a superset of CF grid_mapping).
 
-        # TODO: write a reve cube to a zarr store
-        pass
+        Parameters
+        ----------
+        out_store : str
+            Path to the output Zarr directory store (e.g. ``"scene_l2r.zarr"``).
+        consolidated : bool, default True
+            Write a consolidated ``.zmetadata`` file for fast remote access.
+        """
+        ds = self.in_ds.copy()
+
+        # --- Build spatial_ref scalar variable ---------------------------------
+        # GDAL reads crs_wkt + GeoTransform from this variable to reconstruct
+        # the full georeferencing.  spatial_ref duplicates crs_wkt as a GDAL
+        # compatibility alias.
+        crs_wkt = self.CRS.to_wkt()
+        a = self.Affine
+
+        # GDAL GeoTransform: (x_origin, pixel_width, x_rot,
+        #                      y_origin,    y_rot,  pixel_height)
+        # For a north-up image: x_rot == y_rot == 0, pixel_height < 0.
+        geo_transform = f"{a.c} {a.a} {a.b} {a.f} {a.d} {a.e}"
+
+        spatial_ref = xr.Variable(
+            (),
+            np.int32(0),
+            attrs={
+                "grid_mapping_name": self.CRS.to_cf().get("grid_mapping_name", ""),
+                "crs_wkt":           crs_wkt,
+                "spatial_ref":       crs_wkt,   # GDAL alias
+                "GeoTransform":      geo_transform,
+            },
+        )
+        ds = ds.assign({"spatial_ref": spatial_ref})
+
+        # --- Tag every spatially-explicit variable with grid_mapping -----------
+        # A variable is "spatially explicit" when both 'y' and 'x' appear in
+        # its dimensions.
+        updated_vars = {}
+        for name, var in ds.data_vars.items():
+            if name == "spatial_ref":
+                continue
+            if "y" in var.dims and "x" in var.dims:
+                updated_vars[name] = var.assign_attrs(
+                    {**var.attrs, "grid_mapping": "spatial_ref"}
+                )
+        if updated_vars:
+            ds = ds.assign(updated_vars)
+
+        # --- Global attributes -------------------------------------------------
+        ds.attrs.setdefault("Conventions", "CF-1.0")
+        ds.attrs["creation_time"] = datetime.datetime.utcnow().strftime(
+            "%Y-%m-%dT%H:%M:%SZ"
+        )
+
+        # --- Write -------------------------------------------------------------
+        ds.to_zarr(out_store, mode="w", consolidated=consolidated)
+        log.info("Image written to Zarr store → %s", out_store)
+
+    def zarr_to_nc(self, zarr_path: str, nc_path: str) -> None:
+        """Convert a Zarr store produced by :meth:`to_zarr` to CF NetCDF.
+
+        All CF metadata (``spatial_ref``, ``grid_mapping`` attributes,
+        ``Conventions``) are already embedded in the Zarr store, so this
+        is a straight pass-through via xarray.
+
+        Parameters
+        ----------
+        zarr_path : str
+            Path to the source Zarr directory store.
+        nc_path : str
+            Destination NetCDF file path (``*.nc``).
+        """
+        ds = xr.open_zarr(zarr_path)
+        ds.to_netcdf(nc_path)
+        log.info("Zarr → NetCDF written → %s", nc_path)

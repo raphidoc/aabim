@@ -1,37 +1,27 @@
 # Standard library imports
 import logging
-import os
 from abc import ABC
 import datetime
-import re
-import math
 
 # Third party imports
-import netCDF4
 import numpy as np
 import pyproj
-import pandas as pd
-import geopandas as gpd
-from statsmodels.tsa.forecasting.theta import extend_index
-from tqdm import tqdm
-from p_tqdm import p_uimap
-import shapely
 import xarray as xr
-import zarr
 import affine
 from rasterio.windows import Window
-from shapely.geometry import Point, box
 
-# REVERIE import
-from reverie.utils import helper, astronomy
-from reverie.image.tile import Tile
-from reverie.utils.cf_aliases import get_cf_std_name
+# aabim import
+from aabim.utils import helper, astronomy
+from aabim.image.tile import Tile
+from aabim.image.sensor import Sensor
 
 from .io import IOMixin
 from .extract import ExtractMixin
+from .calibrate import CalibrateMixin
+from .correct import CorrectMixin
 
 
-class Image(IOMixin, ExtractMixin, ABC):
+class Image(IOMixin, ExtractMixin, CalibrateMixin, CorrectMixin, ABC):
     """
     Image class is used as the base template for spectral imagery data structure in AABIM.
     This class is to be expanded by converter specific class as in ../converter/wise/read_pix.py
@@ -123,7 +113,7 @@ class Image(IOMixin, ExtractMixin, ABC):
         self.Affine = Affine
         self.CRS = crs
 
-        self.level = None  # "L1", "L1C", "L2"
+        self.level = level
 
         self.center_lon = None
         self.center_lat = None
@@ -131,7 +121,7 @@ class Image(IOMixin, ExtractMixin, ABC):
         self.lat_grid = None
 
         # Sensor attribute store metadata from the sensor in a dictionary
-        self.sensor = {}
+        self.sensor = Sensor(name="unknown", wavelengths=wavelength)
 
         # Optional attributes
 
@@ -396,6 +386,37 @@ class Image(IOMixin, ExtractMixin, ABC):
         c = self.x[0].values
         f = self.y[0].values
         self.Affine = affine.Affine(a, b, c, d, e, f)
+
+    def crop(self, bbox: dict) -> "Image":
+        """Crop image in place to a lat/lon bounding box.
+
+        Parameters
+        ----------
+        bbox : dict
+            ``{"lon": (west, east), "lat": (south, north)}``
+
+        Returns
+        -------
+        self
+        """
+        transformer = pyproj.Transformer.from_crs(4326, self.CRS, always_xy=True)
+        x_west, y_south = transformer.transform(bbox["lon"][0], bbox["lat"][0])
+        x_east, y_north = transformer.transform(bbox["lon"][1], bbox["lat"][1])
+
+        # x is ascending; y is descending (north-up raster convention)
+        cropped_ds = self.in_ds.sel(x=slice(x_west, x_east), y=slice(y_north, y_south))
+
+        # Update origin in grid_mapping to reflect the new spatial extent
+        new_x0 = float(cropped_ds.x[0])
+        new_y0 = float(cropped_ds.y[0])
+        cropped_ds["grid_mapping"].attrs["affine_transform"] = (
+            self.Affine.a, self.Affine.b, new_x0,
+            self.Affine.d, self.Affine.e, new_y0,
+        )
+
+        self.in_ds = cropped_ds
+        self.update_attributes()
+        return self
 
     def create_windows(self, window_size: int) -> list[Window]:
         n_y = len(self.y)

@@ -2,7 +2,7 @@ import os
 import numpy as np
 from pandas import Series
 
-from reverie.utils.helper import read_envi_hdr
+from aabim.utils.helper import read_envi_hdr
 
 
 class ErrorFlightLine(Exception):

@@ -1,0 +1,9 @@
+{
+    "python.analysis.extraPaths": [
+        "/home/raphael/python_projects/aabim"
+    ],
+    "terminal.integrated.env.linux": {
+        "PYTHONPATH": "/home/raphael/python_projects/aabim"
+    },
+    "python.envFile": "${workspaceFolder}/.env"
+}

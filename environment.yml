@@ -6,12 +6,15 @@ dependencies:
   - python
   - black
   - numpy
+  - cupy
+  - scipy
   - dask
   - netCDF4
   - h5py
   - gdal
   - pyproj
   - pandas
+  - pooch
   - geopandas
   - tqdm
   - timezonefinder
@@ -23,7 +26,8 @@ dependencies:
   - zarr
   - affine
   - rasterio
+  - ipykernel
   - pip
-  - scipy
   - pip:
     - p_tqdm
+    - pylr2
