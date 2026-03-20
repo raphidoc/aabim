@@ -374,6 +374,53 @@ class Image(IOMixin, ExtractMixin, CalibrateMixin, CorrectMixin, ABC):
     def cal_view_geom(self):
         pass
 
+    @property
+    def fwhm(self) -> np.ndarray | None:
+        """Per-band sensor FWHM (nm), or ``None`` if not stored in the dataset.
+
+        Reads ``in_ds["fwhm"]`` when present (written by
+        :meth:`~aabim.converter.wise.read_pix.Pix.to_aabim_nc`).  Returns
+        ``None`` when the dataset pre-dates FWHM storage, in which case
+        callers may fall back to estimating the bandwidth from the wavelength
+        spacing.
+        """
+        if "fwhm" in self.in_ds:
+            return np.asarray(self.in_ds["fwhm"].values, dtype=np.float64)
+        return None
+
+    @property
+    def srf(self) -> tuple[np.ndarray, np.ndarray] | None:
+        """Spectral response function as a ``(srf_wl, srf_matrix)`` pair.
+
+        * ``srf_wl``     — 1-D float64 array ``(n_fine,)`` — fine wavelength
+          axis in nm.
+        * ``srf_matrix`` — 2-D float64 array ``(n_fine, n_bands)`` — per-band
+          SRF values (peak-normalized to 1).
+
+        Resolution order:
+
+        1. **Tabulated RSR** — if the dataset contains ``srf`` and
+           ``wavelength_srf`` variables (multispectral sensors).
+        2. **Gaussian from FWHM** — if ``fwhm`` is stored, a Gaussian SRF is
+           computed on-the-fly at 0.1 nm resolution (hyperspectral sensors
+           such as WISE).
+        3. Returns ``None`` when neither is available.
+        """
+        if "srf" in self.in_ds and "wavelength_srf" in self.in_ds:
+            srf_wl = np.asarray(self.in_ds["wavelength_srf"].values, dtype=np.float64)
+            srf_matrix = np.asarray(self.in_ds["srf"].values, dtype=np.float64)
+            return srf_wl, srf_matrix
+        fwhm = self.fwhm
+        if fwhm is not None:
+            from aabim.image.sensor import Sensor
+            sensor = Sensor(
+                name="", wavelengths=np.asarray(self.wavelength, dtype=np.float64),
+                fwhm=fwhm,
+            )
+            srf_wl, srf_matrix = sensor.to_gaussian_srf(resolution=0.1)
+            return srf_wl, srf_matrix.astype(np.float64)
+        return None
+
     def update_attributes(self):
         self.wavelength = self.in_ds.wavelength.values
         self.y = self.in_ds.y

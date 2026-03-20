@@ -1,0 +1,30 @@
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up conda environment
+        uses: conda-incubator/setup-miniconda@v3
+        with:
+          environment-file: environment.yml
+          activate-environment: aabim
+          miniforge-version: latest
+          use-mamba: true
+
+      - name: Install package
+        shell: bash -el {0}
+        run: pip install -e . --no-deps
+
+      - name: Run tests
+        shell: bash -el {0}
+        run: pytest tests/ -q --tb=short

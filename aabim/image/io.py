@@ -98,9 +98,12 @@ class IOMixin:
 
         grid_mapping = in_ds.variables["grid_mapping"]
 
-        # Get affine_transform and crs from grid_mapping
-        a, b, c, d, e, f = grid_mapping.attrs["affine_transform"]
-        Affine = affine.Affine(a, b, c, d, e, f)
+        # Derive Affine from the actual x/y coordinates so it is always
+        # consistent with the dataset extent (including bbox subsets).
+        dx = float(x[1] - x[0])
+        dy = float(y[1] - y[0])
+        Affine = affine.Affine(dx, 0.0, float(x[0]) - dx / 2.0,
+                               0.0, dy,  float(y[0]) - dy / 2.0)
         crs = pyproj.CRS.from_wkt(grid_mapping.attrs["crs_wkt"])
 
         level = in_ds.attrs.get("processing_level", None)

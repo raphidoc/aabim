@@ -1,0 +1,64 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "aabim"
+version = "0.1.0"
+description = "Atmospheric and Aquatic Bayesian Inversion Model for hyperspectral remote sensing of optically shallow water"
+readme = "README.md"
+license = { file = "LICENSE" }
+authors = [
+    { name = "Raphael Mabit" }
+]
+requires-python = ">=3.10"
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Science/Research",
+    "Topic :: Scientific/Engineering :: Atmospheric Science",
+    "Topic :: Scientific/Engineering :: Hydrology",
+    "License :: OSI Approved :: GNU General Public License v3 (GPLv3)",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+]
+dependencies = [
+    "numpy",
+    "scipy",
+    "xarray",
+    "zarr",
+    "dask",
+    "netCDF4",
+    "pandas",
+    "geopandas",
+    "shapely",
+    "rasterio",
+    "pyproj",
+    "affine",
+    "pooch",
+    "tqdm",
+    "statsmodels",
+    "timezonefinder",
+    "pendulum",
+    "pylr2",
+]
+
+[project.optional-dependencies]
+gpu = ["cupy"]
+dev = ["pytest", "black", "jupyter"]
+
+[project.urls]
+Homepage = "https://github.com/raphael-mabit/aabim"
+Source   = "https://github.com/raphael-mabit/aabim"
+Issues   = "https://github.com/raphael-mabit/aabim/issues"
+
+[tool.setuptools.packages.find]
+where   = ["."]
+include = ["aabim*"]
+
+[tool.setuptools.package-data]
+"aabim" = ["data/**/*"]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]

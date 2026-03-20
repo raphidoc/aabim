@@ -116,5 +116,7 @@ dmypy.json
 
 # Data files that should not be on GitHub
 *.nc
+!tests/data/ACI13_bbox_l1c.nc
 *.mat
-tests/data/tmp/*
+tests/data/tmp/
+*.zarr

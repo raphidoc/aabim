@@ -205,15 +205,67 @@ def _correction_worker(args: dict) -> None:
 # Pure physics helpers
 # ---------------------------------------------------------------------------
 
-def _solar_irradiance(wavelength: np.ndarray, doy: int) -> np.ndarray:
-    """Coddington F0, Earth–Sun corrected, in uW cm⁻² nm⁻¹."""
+def _solar_irradiance(
+    wavelength: np.ndarray,
+    doy: int,
+    fwhm: np.ndarray | None = None,
+    srf_wl: np.ndarray | None = None,
+    srf: np.ndarray | None = None,
+) -> np.ndarray:
+    """Coddington F0, Earth–Sun corrected, in uW cm⁻² nm⁻¹.
+
+    When *fwhm* is provided, a per-band Gaussian SRF is evaluated at the
+    Coddington native resolution (~0.001 nm) and used to compute the
+    band-averaged F0, matching the approach of the original get_f0()
+    implementation and correctly averaging out all Fraunhofer features:
+
+        F0_band = Σ F0(λ) · G(λ; λ_c, σ) / Σ G(λ; λ_c, σ)
+
+    When *srf_wl* / *srf* are provided instead (tabulated RSR for
+    multispectral sensors), the spectrum is interpolated onto that grid
+    before the weighted average.
+
+    Parameters
+    ----------
+    wavelength : np.ndarray, shape (n_bands,)
+        Band-centre wavelengths (nm).
+    doy : int
+        Day-of-year for the Earth–Sun distance correction.
+    fwhm : np.ndarray, shape (n_bands,), optional
+        Per-band FWHM (nm).  When provided, a Gaussian SRF is computed at
+        the Coddington native wavelengths for each band.
+    srf_wl : np.ndarray, shape (n_fine,), optional
+        Fine wavelength axis of a tabulated SRF (nm).
+    srf : np.ndarray, shape (n_fine, n_bands), optional
+        Per-band tabulated SRF values (any normalization).
+    """
     ds      = xr.open_dataset(_F0_PATH)
     f0_wl   = ds["Vacuum Wavelength"].values   # nm
     f0_ssi  = ds["SSI"].values                 # W m⁻² nm⁻¹
     ds.close()
 
     dist_factor = 1.0 + 0.034 * np.cos(2 * np.pi * (doy - 2) / 365.0)
-    return np.interp(wavelength, f0_wl, f0_ssi * dist_factor) * 100.0
+    f0_corrected = f0_ssi * dist_factor * 100.0   # → uW cm⁻² nm⁻¹
+
+    if fwhm is not None:
+        # Evaluate Gaussian SRF at Coddington native resolution per band,
+        # then compute the normalised weighted average.  Only the F0 values
+        # within 4 σ of each band centre are used for efficiency.
+        sigma    = fwhm / (2.0 * np.sqrt(2.0 * np.log(2.0)))
+        f0_bands = np.empty(len(wavelength), dtype=np.float32)
+        for i, (wl_c, sig) in enumerate(zip(wavelength, sigma)):
+            mask    = np.abs(f0_wl - wl_c) <= 4.0 * sig
+            w       = np.exp(-0.5 * ((f0_wl[mask] - wl_c) / sig) ** 2)
+            f0_bands[i] = np.dot(f0_corrected[mask], w) / w.sum()
+        return f0_bands
+
+    if srf_wl is not None and srf is not None:
+        # Tabulated RSR: interpolate Coddington onto the SRF fine grid.
+        f0_on_srf = np.interp(srf_wl, f0_wl, f0_corrected)   # (n_fine,)
+        # Weighted average: (n_fine,) @ (n_fine, n_bands) → (n_bands,)
+        return (f0_on_srf @ srf / srf.sum(axis=0)).astype(np.float32)
+
+    return np.interp(wavelength, f0_wl, f0_corrected).astype(np.float32)
 
 
 def _fresnel_nadir(n_w: np.ndarray) -> np.ndarray:
@@ -238,8 +290,19 @@ class CorrectMixin:
         Returns a lazy DataArray (wavelength, y, x).
         """
         wavelength = np.asarray(self.wavelength, dtype=np.float64)
-        doy  = self.acq_time_z.timetuple().tm_yday
-        f0   = _solar_irradiance(wavelength, doy).astype(np.float32)
+        doy      = self.acq_time_z.timetuple().tm_yday
+        fwhm     = self.fwhm
+        if fwhm is not None:
+            # Gaussian SRF evaluated at Coddington native resolution
+            f0 = _solar_irradiance(wavelength, doy, fwhm=fwhm)
+        else:
+            srf_data = self.srf   # tabulated RSR for multispectral sensors
+            if srf_data is not None:
+                srf_wl, srf_matrix = srf_data
+                f0 = _solar_irradiance(wavelength, doy,
+                                       srf_wl=srf_wl, srf=srf_matrix)
+            else:
+                f0 = _solar_irradiance(wavelength, doy)
 
         f0_da   = xr.DataArray(f0, dims=["wavelength"],
                                coords={"wavelength": self.in_ds.wavelength})
@@ -555,7 +618,6 @@ class CorrectMixin:
         zarr.consolidate_metadata(output)
         log.info("L2R image complete → %s", output)
 
-        from aabim.image.io import IOMixin
         result = copy.copy(self)
         result.in_ds = xr.open_zarr(output)
         result.level = "L2R"

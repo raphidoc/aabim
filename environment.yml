@@ -3,31 +3,34 @@ channels:
   - conda-forge
   - ocdb
 dependencies:
-  - python
-  - black
+  - python>=3.10
   - numpy
-  - cupy
   - scipy
+  - xarray
+  - zarr
   - dask
   - netCDF4
   - h5py
-  - gdal
-  - pyproj
   - pandas
-  - pooch
   - geopandas
+  - shapely
+  - rasterio
+  - pyproj
+  - affine
+  - pooch
   - tqdm
+  - statsmodels
   - timezonefinder
   - pendulum
   - charset-normalizer
-  - shapely
-  - statsmodels
-  - xarray
-  - zarr
-  - affine
-  - rasterio
+  - matplotlib
+  - gdal
   - ipykernel
+  - black
+  # Optional — GPU-accelerated backend (requires an NVIDIA GPU and CUDA drivers).
+  # Remove this line if you do not have a GPU.
+  - cupy
   - pip
   - pip:
-    - p_tqdm
+    # Type-II (SMA/OLS/Ratio) calibration model — not yet on conda-forge.
     - pylr2

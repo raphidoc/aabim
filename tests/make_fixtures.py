@@ -17,6 +17,15 @@ Ancillary data (MERRA-2) is added separately via ``add_ancillary()`` during
 processing and is not baked into this fixture.
 """
 
+# import os
+# import sys
+# # Ensure CONDA_PREFIX is set so CuPy (imported transitively via zarr) can
+# # locate the CUDA libraries.  This is a no-op when the env is activated
+# # normally; it only matters when the interpreter is invoked directly (e.g.
+# # from a VSCode "Run File" button) without conda activate.
+# if "CONDA_PREFIX" not in os.environ:
+#     os.environ["CONDA_PREFIX"] = sys.prefix
+
 import logging
 logging.basicConfig(level=logging.DEBUG, format="%(levelname)s  %(name)s — %(message)s")
 
@@ -32,8 +41,7 @@ OUT_DIR = Path(__file__).parent / "data"
 if __name__ == "__main__":
     OUT_DIR.mkdir(exist_ok=True)
 
-    pix = Pix(PIX_DIR)
-    pix.crop(bbox=BBOX)
+    pix = Pix(PIX_DIR, bbox=BBOX)
 
     out = OUT_DIR / "ACI13_bbox_l1c.nc"
     pix.to_aabim_nc(str(out))

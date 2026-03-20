@@ -54,7 +54,18 @@ class Pix(Image):
         and navigation files.
     """
 
-    def __init__(self, pix_dir: str | Path):
+    def __init__(self, pix_dir: str | Path, bbox: dict | None = None):
+        """
+        Parameters
+        ----------
+        pix_dir : str or Path
+            Path to the ``.dpix`` directory.
+        bbox : dict, optional
+            ``{"lon": (west, east), "lat": (south, north)}``.  When provided,
+            the spatial crop is applied *before* geometry arrays are allocated,
+            which avoids out-of-memory errors on large images.  Equivalent to
+            calling :meth:`crop` afterwards, but much more memory-efficient.
+        """
         t0 = time.perf_counter()
 
         pix_dir = str(pix_dir)
@@ -97,6 +108,28 @@ class Pix(Image):
         log.debug("CRS: EPSG:%s", crs.to_epsg())
 
         y, x = self._compute_yx(Affine, n_rows, n_cols)
+
+        # --- Early bbox crop (before geometry arrays are allocated) ----------- #
+        self._crop_offset = (0, 0)   # (row_offset, col_offset)
+        self._gdal_window = None
+        if bbox is not None:
+            transformer = pyproj.Transformer.from_crs(4326, crs, always_xy=True)
+            x_west,  y_south = transformer.transform(bbox["lon"][0], bbox["lat"][0])
+            x_east,  y_north = transformer.transform(bbox["lon"][1], bbox["lat"][1])
+            col_idx = np.where((x >= x_west) & (x <= x_east))[0]
+            row_idx = np.where((y >= y_south) & (y <= y_north))[0]
+            if col_idx.size == 0 or row_idx.size == 0:
+                raise ValueError("bbox does not overlap the image extent.")
+            c0, c1 = int(col_idx[0]), int(col_idx[-1]) + 1
+            r0, r1 = int(row_idx[0]), int(row_idx[-1]) + 1
+            self._gdal_window = (r0, c0, c1 - c0, r1 - r0)
+            self._crop_offset = (r0, c0)
+            x = x[c0:c1];  y = y[r0:r1]
+            n_cols = len(x);  n_rows = len(y)
+            log.debug(
+                "Early bbox crop → %d rows × %d cols  window=%s",
+                n_rows, n_cols, self._gdal_window,
+            )
 
         # --- Scale factor ---------------------------------------------------- #
         scale_raw = [v for k, v in self.header.items() if "scale" in k][0]
@@ -166,7 +199,13 @@ class Pix(Image):
         )
         # Image.__init__ resets no_data to None — restore the value we parsed above
         self.no_data = int(ignore) if ignore.strip() else -99999
-        self.sensor = Sensor(name="WISE", wavelengths=wavelength)
+        fwhm_raw = self.header.get("fwhm", "")
+        fwhm = (
+            np.array([float(w) for w in fwhm_raw.replace("{", "").replace("}", "").split(",")])
+            if fwhm_raw.strip()
+            else None
+        )
+        self.sensor = Sensor(name="WISE", wavelengths=wavelength, fwhm=fwhm)
 
         # --- Geometry -------------------------------------------------------- #
         log.debug("Computing sun geometry …")
@@ -194,7 +233,13 @@ class Pix(Image):
             super().cal_valid_mask()
             return self.valid_mask
         # in_ds not yet populated (called during __init__): read first band from GDAL
-        data = self.src_ds.GetRasterBand(1).ReadAsArray()
+        gdal_win = getattr(self, "_gdal_window", None)
+        band = self.src_ds.GetRasterBand(1)
+        if gdal_win is not None:
+            r0, c0, win_x, win_y = gdal_win
+            data = band.ReadAsArray(xoff=c0, yoff=r0, win_xsize=win_x, win_ysize=win_y)
+        else:
+            data = band.ReadAsArray()
         self.valid_mask = data != self.no_data
         log.debug("Valid mask: %d / %d px", self.valid_mask.sum(), self.valid_mask.size)
         return self.valid_mask
@@ -234,12 +279,18 @@ class Pix(Image):
         v_sample  = np.full((self.n_rows, self.n_cols), np.nan)
         v_line    = np.full((self.n_rows, self.n_cols), np.nan)
 
+        row_off, col_off = getattr(self, "_crop_offset", (0, 0))
         for row in tqdm(range(self.flightline.lines), desc="Processing GLU"):
             xs, ys = x_glu[row], y_glu[row]
             rows_c, cols_c = helper.transform_rowcol(
                 self.Affine, xs=xs, ys=ys, precision=5
             )
-            mask = (rows_c < self.n_rows) & (cols_c < self.n_cols)
+            rows_c = rows_c - row_off
+            cols_c = cols_c - col_off
+            mask = (
+                (rows_c >= 0) & (rows_c < self.n_rows) &
+                (cols_c >= 0) & (cols_c < self.n_cols)
+            )
             rows_c, cols_c = rows_c[mask], cols_c[mask]
 
             v_zenith[rows_c, cols_c]  = v_zenith_fl[row][mask]
@@ -368,6 +419,15 @@ class Pix(Image):
             self.header["bbl"].split(",  ")
         )
         self.out_ds.variables["radiance_at_sensor"].units = "uW cm-2 nm-1 sr-1"
+        self.out_ds.variables["radiance_at_sensor"].standard_name = (
+            "upwelling_radiance_per_unit_wavelength_in_air"
+        )
+
+        if self.sensor.fwhm is not None:
+            fwhm_var = self.out_ds.createVariable("fwhm", "f4", ("wavelength",))
+            fwhm_var[:] = self.sensor.fwhm
+            fwhm_var.units = "nm"
+            fwhm_var.long_name = "Sensor spectral bandwidth (full-width at half-maximum)"
 
         for band in tqdm(range(len(self.wavelength)), desc="Writing radiance"):
             gdal_band = self.src_ds.GetRasterBand(band + 1)
