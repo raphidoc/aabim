@@ -26,6 +26,7 @@ dependencies:
   - matplotlib
   - gdal
   - ipykernel
+  - pytest
   - black
   # Optional — GPU-accelerated backend (requires an NVIDIA GPU and CUDA drivers).
   # Remove this line if you do not have a GPU.
