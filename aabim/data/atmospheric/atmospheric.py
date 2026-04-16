@@ -440,12 +440,13 @@ class AerLUT(BaseLUT):
             s   = self.interps["s"](xi)
             g   = self.interps["sky_glint"](xi)
 
+        aod_grid_np = np.asarray(aod_grid, dtype=np.float32)
         return {
-            "aod_grid":     np.asarray(aod_grid, dtype=np.float32),
-            "rho_path_ra":  rho,
-            "t_ra":         t,
-            "s_ra":         s,
-            "sky_glint_ra": g,
+            "Naod":        int(len(aod_grid_np)),
+            "aod_grid":    aod_grid_np,
+            "rho_path_ra": rho,
+            "t_ra":        t,
+            "s_ra":        s,
         }
 
 

@@ -24,6 +24,8 @@ dependencies:
   - pendulum
   - charset-normalizer
   - matplotlib
+  - scikit-image
+  - cmdstanpy
   - gdal
   - ipykernel
   - pytest

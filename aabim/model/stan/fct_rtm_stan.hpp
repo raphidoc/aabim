@@ -1,8 +1,8 @@
 #pragma once
 #include <stan/math.hpp>
 #include <Eigen/Dense>
-#include "../include/rtm_core.hpp"
-#include "../include/atm_core.hpp"
+#include "rtm_core.hpp"
+#include "atm_core.hpp"
 
 
 // Keep Stan-friendly signatures (return_type_t, pstream__) but call the core.
