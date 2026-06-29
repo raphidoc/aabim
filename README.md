@@ -3,7 +3,7 @@
 [![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](https://www.gnu.org/licenses/gpl-3.0)
 [![Code style: black](https://img.shields.io/badge/code%20style-black-000000.svg)](https://github.com/psf/black)
 
-AABIM is a Python package for the retrieval of reflectance products from airborne hyperspectral imagery in coastal environement. It is composed of an atmospheric correction and system vicarious calibration model to retrieve water leaving reflectance, and a bayesian inversion model to retrieve water optical proprieties water depth and bottom reflectance.
+AABIM is a Python package for the retrieval of reflectance products from airborne hyperspectral imagery in coastal environement. It is composed of an atmospheric correction and system vicarious calibration model to retrieve water leaving reflectance, and a bayesian inversion model to retrieve water optical proprieties, water depth and bottom reflectance.
 It was developed as part of Raphael Mabit's PhD thesis:
 
 > Mabit, R. (2026). *Réflectances d'Anticosti : radiométrie in situ, imagerie hyperspectrale aéroportée et inversion bayésienne en eaux optiquement peu profondes.*
