@@ -3,7 +3,7 @@
 [![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](https://www.gnu.org/licenses/gpl-3.0)
 [![Code style: black](https://img.shields.io/badge/code%20style-black-000000.svg)](https://github.com/psf/black)
 
-AABIM is a Python package for the atmospheric correction and water-leaving reflectance retrieval of airborne hyperspectral imagery over optically shallow water.
+AABIM is a Python package for the retrieval of reflectance products from airborne hyperspectral imagery in coastal environement. It is composed of an atmospheric correction and system vicarious calibration model to retrieve water leaving reflectance, and a bayesian inversion model to retrieve water optical proprieties water depth and bottom reflectance.
 It was developed as part of Raphael Mabit's PhD thesis:
 
 > Mabit, R. (2026). *Réflectances d'Anticosti : radiométrie in situ, imagerie hyperspectrale aéroportée et inversion bayésienne en eaux optiquement peu profondes.*
@@ -12,12 +12,13 @@ It was developed as part of Raphael Mabit's PhD thesis:
 
 ## Features
 
-- **Image conversion** — reads WISE `.dpix` (ENVI) format; extensible to other sensors
-- **Ancillary data** — automatic download of MERRA-2 atmospheric variables (AOD, pressure, water vapour, ozone) via NASA EarthData
+- **Image conversion** — reads WISE `.dpix` (ENVI) format and convert it to AABIM Zarr or NetCDF GDAL compliant format; extensible to other sensors
+- **Ancillary data** — automatic download of MERRA-2 atmospheric variables (AOD, pressure, water vapour, ozone) via NASA EarthData (requier credentials)
 - **Vicarious calibration** — SMA, OLS, and ratio models fit from in-situ water-leaving reflectance matchups
-- **Atmospheric correction** — 6S-based LUT interpolation with per-band Gaussian SRF convolution of the Coddington solar spectrum; G21 sky-glint correction
-- **Pixel extraction** — spatial matchup extraction with configurable window averaging
-- **CPU and GPU backends** — tiled parallel processing with `ProcessPoolExecutor` (CPU) or CuPy (GPU)
+- **Atmospheric correction** — water leaving reflecance retrieval with 6S-based atmospheric gases and aerosol LUTs, Coddington solar spectrum and GL21 sky-glint correction
+- **Bayesian inversion** — water optical proprieties, water depth, bottom reflectance retieval 
+- **Pixel extraction** — spatial matchup extraction with configurable window statistics
+- **CPU and GPU backends** — tiled parallel processing with `ProcessPoolExecutor` (CPU) or sequential processing with CuPy (GPU)
 
 ---
 
@@ -33,7 +34,7 @@ pip install -e .
 
 > **GPU support** (optional): the GPU backend uses [CuPy](https://cupy.dev/). It is included in `environment.yml` by default. Remove the `cupy` line if you do not have an NVIDIA GPU with CUDA drivers installed.
 
-> **SMA calibration** (`SMAModel`) requires [`pylr2`](https://github.com/amaurs/then-what), installed via pip as listed in `environment.yml`. A conda-forge feedstock is planned.
+> **SMA calibration** (`SMAModel`) requires [`pylr2`](https://github.com/amaurs/then-what), installed via pip as listed in `environment.yml`.
 
 ---
 
@@ -64,7 +65,7 @@ See [`aabim/example/l2r_sma_calibration.ipynb`](aabim/example/l2r_sma_calibratio
 
 ## Sensor conversion
 
-The converter reads a WISE `.dpix` ENVI image and writes a self-contained CF-1.0 NetCDF:
+The converter reads a WISE `.dpix` ENVI image and writes a self-contained CF-1.0 NetCDF or Zarr store:
 
 ```python
 from aabim.converter.wise.read_pix import Pix
