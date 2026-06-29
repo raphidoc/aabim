@@ -9,7 +9,7 @@ import numpy as np
 import pytest
 import xarray as xr
 
-from tests.conftest import TMP_DIR
+from tests.conftest import DATA_DIR, TMP_DIR
 
 
 # --------------------------------------------------------------------------- #
@@ -171,6 +171,20 @@ def test_to_l2r_rho_w_nan_on_land(l2r_zarr):
             "rho_w should be NaN on all non-water pixels"
 
 
+def test_to_l2r_rho_w_finite_on_water(l2r_zarr):
+    """rho_w must have at least some finite values on water pixels.
+
+    Guards against the no-data regression where all workers return early
+    because rho_at_sensor reads back as all-NaN.
+    """
+    _, img = l2r_zarr
+    mw    = img.in_ds["mask_water"].values.astype(bool)
+    rho_w = img.in_ds["rho_w"].values
+    if mw.any():
+        assert np.isfinite(rho_w[:, mw]).any(), \
+            "rho_w has no finite values on water pixels — likely a nodata regression"
+
+
 def test_to_l2r_zarr_written(l2r_zarr):
     path, _ = l2r_zarr
     import os
@@ -189,5 +203,106 @@ def test_l2r_artifacts_saved_to_tmp(l2r_zarr):
         "NetCDF copy not found in tests/data/tmp/"
 
     ds = xr.open_dataset(TMP_DIR / "ACI13_bbox_l2r.nc")
+    assert "rho_w" in ds
+    assert ds.attrs.get("processing_level") == "L2R"
+
+
+# --------------------------------------------------------------------------- #
+# to_l2r with SMA calibration model                                            #
+# --------------------------------------------------------------------------- #
+
+
+@pytest.fixture(scope="module")
+def l2r_sma_zarr(aci13_l1c_anc):
+    """Run to_l2r once with a pre-fitted SMA cal_model; save to tests/data/tmp/.
+
+    The model is loaded from the committed CSV
+    ``tests/data/sma_calibration_model.csv`` so no pylr2 fitting is required.
+
+    Outputs:
+        tests/data/tmp/ACI13_bbox_l2r_sma.zarr  — primary Zarr store
+        tests/data/tmp/ACI13_bbox_l2r_sma.nc    — CF NetCDF copy
+    """
+    import shutil
+    from aabim.calibration import SMAModel
+
+    model_csv = DATA_DIR / "sma_calibration_model.csv"
+    if not model_csv.exists():
+        pytest.skip(f"SMA model CSV not found: {model_csv}")
+
+    zarr_out = str(TMP_DIR / "ACI13_bbox_l2r_sma.zarr")
+    nc_out   = str(TMP_DIR / "ACI13_bbox_l2r_sma.nc")
+
+    if (TMP_DIR / "ACI13_bbox_l2r_sma.zarr").exists():
+        shutil.rmtree(zarr_out)
+    if (TMP_DIR / "ACI13_bbox_l2r_sma.nc").exists():
+        (TMP_DIR / "ACI13_bbox_l2r_sma.nc").unlink()
+
+    sma_model = SMAModel.load(str(model_csv))
+    aci13_l1c_anc.mask_wavelength([361.51, 990.0])
+
+    img = aci13_l1c_anc.to_l2r(
+        zarr_out, cal_model=sma_model, n_workers=1, window_size=64,
+    )
+    img.zarr_to_nc(zarr_out, nc_out)
+
+    return zarr_out, img
+
+
+def test_to_l2r_sma_returns_image(l2r_sma_zarr, aci13_l1c_anc):
+    _, img = l2r_sma_zarr
+    assert type(img) is type(aci13_l1c_anc)
+
+
+def test_to_l2r_sma_processing_level(l2r_sma_zarr):
+    _, img = l2r_sma_zarr
+    assert img.level == "L2R"
+    assert img.in_ds.attrs["processing_level"] == "L2R"
+
+
+def test_to_l2r_sma_cal_model_attr(l2r_sma_zarr):
+    """cal_model attribute is stored in the output dataset attrs."""
+    _, img = l2r_sma_zarr
+    assert img.in_ds.attrs.get("cal_model") is not None
+
+
+def test_to_l2r_sma_output_variables(l2r_sma_zarr):
+    """All expected output variables are present."""
+    _, img = l2r_sma_zarr
+    for var in ("rho_at_sensor", "rho_s", "rho_w", "rho_w_gl21",
+                "ndwi", "mask_water"):
+        assert var in img.in_ds, f"Missing variable: {var}"
+
+
+def test_to_l2r_sma_rho_w_nan_on_land(l2r_sma_zarr):
+    """rho_w must be NaN wherever mask_water == 0."""
+    _, img = l2r_sma_zarr
+    mw    = img.in_ds["mask_water"].values.astype(bool)
+    rho_w = img.in_ds["rho_w"].values
+    land  = ~mw
+    if land.any():
+        assert np.isnan(rho_w[:, land]).all(), \
+            "rho_w should be NaN on all non-water pixels"
+
+
+def test_to_l2r_sma_rho_w_finite_on_water(l2r_sma_zarr):
+    """rho_w must have at least some finite values on water pixels."""
+    _, img = l2r_sma_zarr
+    mw    = img.in_ds["mask_water"].values.astype(bool)
+    rho_w = img.in_ds["rho_w"].values
+    if mw.any():
+        assert np.isfinite(rho_w[:, mw]).any(), \
+            "rho_w has no finite values on water pixels — likely a nodata regression"
+
+
+def test_to_l2r_sma_artifacts_saved_to_tmp(l2r_sma_zarr):
+    """Zarr store and NetCDF copy are present in tests/data/tmp/."""
+    import os
+    assert os.path.isdir(TMP_DIR / "ACI13_bbox_l2r_sma.zarr"), \
+        "SMA Zarr store not found in tests/data/tmp/"
+    assert os.path.isfile(TMP_DIR / "ACI13_bbox_l2r_sma.nc"), \
+        "SMA NetCDF copy not found in tests/data/tmp/"
+
+    ds = xr.open_dataset(TMP_DIR / "ACI13_bbox_l2r_sma.nc")
     assert "rho_w" in ds
     assert ds.attrs.get("processing_level") == "L2R"

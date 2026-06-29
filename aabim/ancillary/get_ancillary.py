@@ -83,10 +83,18 @@ def add_ancillary(image: Image, anc_dir: str | Path | None = None) -> None:
 
     # HDF5 does not allow concurrent read+write access: close the xarray
     # dataset handle before opening the file in append mode, then reopen.
+    import numpy as np
     import xarray as xr
     image.in_ds.close()
     _write_to_nc(image.in_path, scalars)
     image.in_ds = xr.open_dataset(image.in_path)
+    # Round wavelength to 2 dp (float64) to match from_aabim_nc convention —
+    # xr.open_dataset reads float32 from the file, which causes coordinate
+    # mismatches when multiplying against calibration coefficients.
+    if "wavelength" in image.in_ds.coords:
+        image.in_ds = image.in_ds.assign_coords(
+            wavelength=np.round(image.in_ds["wavelength"].values.astype(np.float64), 2)
+        )
     log.info("Ancillary data written to %s", image.in_path)
 
 

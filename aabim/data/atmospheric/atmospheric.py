@@ -142,9 +142,66 @@ class BaseLUT(ABC):
         self.backend = backend
 
     @classmethod
+    def generate(
+        cls,
+        output_path: str | Path,
+        n_workers: int = -1,
+        complevel: int = 4,
+        sixs_bin: str = "sixs_json",
+        **grid_kwargs,
+    ) -> Path:
+        """Generate the base LUT by running 6S and write it to *output_path*.
+
+        Parameters
+        ----------
+        output_path : destination NetCDF file
+        n_workers   : parallel threads (-1 → cpu_count)
+        complevel   : zlib compression level (0–9)
+        sixs_bin    : sixs_json binary name or path (default: "sixs_json" from PATH)
+        **grid_kwargs
+            Optional axis overrides forwarded to the generator function.
+            See :func:`aabim.data.atmospheric.gen_lut_aerosol.generate_aerosol_lut`
+            and :func:`aabim.data.atmospheric.gen_lut_gas.generate_gas_lut`
+            for the available keyword arguments (``sol_zen``, ``rel_azi``,
+            ``wl_nm``, …).
+
+        Returns
+        -------
+        Path
+            Path to the written NetCDF file.
+
+        Examples
+        --------
+        >>> from aabim.data.atmospheric import AerLUT, GasLUT
+        >>> AerLUT.generate("lut_aerosol.nc", n_workers=400)
+        >>> GasLUT.generate("lut_gas.nc",     n_workers=400)
+        """
+        return cls._generate_fn()(
+            output_path=output_path,
+            n_workers=n_workers,
+            complevel=complevel,
+            sixs_bin=sixs_bin,
+            **grid_kwargs,
+        )
+
+    @classmethod
+    @abstractmethod
+    def _generate_fn(cls):
+        """Return the module-level generator function for this LUT type."""
+        ...
+
+    @classmethod
     def load_raw(cls) -> str:
         """Return base LUT dataset."""
         return xr.open_dataset(cls.fetch_raw())
+
+    @classmethod
+    def wavelength_range(cls) -> tuple[float, float]:
+        """Return (wmin, wmax) nm of the base LUT wavelength axis."""
+        ds = cls.load_raw()
+        wmin, wmax = float(ds.wavelength.min()), float(ds.wavelength.max())
+        ds.close()
+        return wmin, wmax
 
     @classmethod
     def from_image(
@@ -165,7 +222,7 @@ class BaseLUT(ABC):
         Steps 2 and 3 are handled by ``cls.fetch_raw`` → ``_registry``.
         """
         sensor_name = image.sensor.name
-        wavelength = np.asarray(image.wavelength, dtype=np.float32)
+        wavelength = np.round(np.asarray(image.wavelength, dtype=np.float64), 2)
 
         ds_sliced, cache_path = cls.load_or_create_sensor_lut(
             sensor_name=sensor_name,
@@ -203,7 +260,8 @@ class BaseLUT(ABC):
         instance = cls.__new__(cls)
         interps, points = instance.build_interps(ds, backend)
         BaseLUT.__init__(
-            instance, interps, points, ds, ds.wavelength.values, backend
+            instance, interps, points, ds,
+            np.round(ds.wavelength.values.astype(np.float64), 2), backend
         )
         instance.cache_path = Path(path)
         return instance
@@ -320,6 +378,11 @@ class AerLUT(BaseLUT):
         return AER_VARIABLES
 
     @classmethod
+    def _generate_fn(cls):
+        from aabim.data.atmospheric.gen_lut_aerosol import generate_aerosol_lut
+        return generate_aerosol_lut
+
+    @classmethod
     def fetch_raw(cls) -> str:
         """Return local path to the base aerosol LUT (download if needed)."""
         return fetch_aer_lut()
@@ -341,7 +404,7 @@ class AerLUT(BaseLUT):
             arr(ds.target_pressure.values),
             arr(ds.sensor_altitude.values),
         )
-        kw = dict(method="linear", bounds_error=False, fill_value=float("nan"))
+        kw = dict(method="linear", bounds_error=True)
         interps = {
             "rho":       ic(points, arr(ds["atmospheric_reflectance_at_sensor"].values), **kw),
             "t":         ic(points, arr(ds["total_scattering_trans_total"].values),       **kw),
@@ -469,6 +532,11 @@ class GasLUT(BaseLUT):
         return GAS_VARIABLES
 
     @classmethod
+    def _generate_fn(cls):
+        from aabim.data.atmospheric.gen_lut_gas import generate_gas_lut
+        return generate_gas_lut
+
+    @classmethod
     def fetch_raw(cls) -> str:
         """Return local path to the base gas LUT (download if needed)."""
         return fetch_gas_lut()
@@ -491,7 +559,7 @@ class GasLUT(BaseLUT):
             arr(ds.target_pressure.values),
             arr(ds.sensor_altitude.values),
         )
-        kw = dict(method="linear", bounds_error=False, fill_value=float("nan"))
+        kw = dict(method="linear", bounds_error=True)
         interps = {
             "t_gas": ic(points, arr(ds["global_gas_trans_total"].values), **kw),
         }

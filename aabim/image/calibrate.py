@@ -68,31 +68,38 @@ class CalibrateMixin:
             self.image_name,
         )
 
+        # --- Clip image to the model's spectral range ----------------------
+        # Bands outside the model range are dropped entirely so that no
+        # uncalibrated reflectance propagates through the pipeline.
+        cal_image = copy.copy(self)
+        model_wl = cal_model.coeffs.wavelength
+        cal_image.mask_wavelength([float(model_wl.min()), float(model_wl.max())])
+        log.info(
+            "Wavelength range after calibration clip: %.2f – %.2f nm  (%d bands)",
+            float(model_wl.min()), float(model_wl.max()), len(cal_image.wavelength),
+        )
+
         # --- Interpolate coefficients to image wavelengths -----------------
-        # The model may have been fitted on a different (possibly coarser)
-        # wavelength grid; linear interpolation keeps things consistent.
+        # Round to 2 dp before interpolation so float32-stored wavelengths
+        # (e.g. 374.78 → 374.77999878) align with 2-dp CSV model coordinates.
         image_wl = xr.DataArray(
-            np.asarray(self.wavelength, dtype=np.float64),
+            np.round(np.asarray(cal_image.wavelength, dtype=np.float64), 2),
             dims=["wavelength"],
         )
         coeffs = cal_model.coeffs.interp(wavelength=image_wl, method="linear")
 
         # --- Apply calibration lazily via xarray arithmetic ----------------
-        ds_cal = self.in_ds.copy()
+        ds_cal = cal_image.in_ds.copy()
 
         if cal_model.model_name == "ratio":
-            gain = coeffs["gain"]
-            ds_cal[_RHO_VAR] = self.in_ds[_RHO_VAR] * gain
+            ds_cal[_RHO_VAR] = cal_image.in_ds[_RHO_VAR] * coeffs["gain"]
         else:
-            # OLS and SMA share the same functional form: a·ρ_t + b
-            a = coeffs["a"]
-            b = coeffs["b"]
-            ds_cal[_RHO_VAR] = a * self.in_ds[_RHO_VAR] + b
+            ds_cal[_RHO_VAR] = coeffs["a"] * cal_image.in_ds[_RHO_VAR] + coeffs["b"]
 
         # --- Traceability attributes ----------------------------------------
         ds_cal.attrs["calibration_model"]       = cal_model.model_name
         ds_cal.attrs["calibration_applied_at"]  = (
-            datetime.datetime.utcnow().isoformat() + "Z"
+            datetime.datetime.now(datetime.timezone.utc).isoformat()
         )
         ds_cal.attrs["calibration_params_json"] = json.dumps(cal_model.to_dict())
         ds_cal.attrs["processing_level"]        = "L1C"
@@ -102,8 +109,6 @@ class CalibrateMixin:
             ds_cal.to_netcdf(output)
             log.info("Calibrated image written → %s", output)
 
-        # --- Return a new Image with the calibrated dataset -----------------
-        cal_image = copy.copy(self)
         cal_image.in_ds = ds_cal
         cal_image.level = "L1C"
         return cal_image

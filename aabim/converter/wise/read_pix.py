@@ -86,8 +86,8 @@ class Pix(Image):
         image_name = re.findall(r".*(?=-L|-N)", pix_f)[0]
         log.debug("Image name: %s", image_name)
 
-        wavelength = np.array(
-            [float(w) for w in self.header["wavelength"].split(",")]
+        wavelength = np.round(
+            np.array([float(w) for w in self.header["wavelength"].split(",")]), 2
         )
         log.debug(
             "Wavelength: %d bands  [%.1f – %.1f nm]",

@@ -106,6 +106,53 @@ _worker_gas_lut = None
 
 def _worker_init(aer_cache: str, gas_cache: str, backend: str) -> None:
     """Load LUT interpolators once per worker process."""
+    import os
+
+    # Force BLAS/LAPACK to 1 thread per worker — n_workers controls parallelism.
+    for _var in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS", "NUMEXPR_NUM_THREADS"):
+        os.environ[_var] = "1"
+
+    # zarr v3 uses asyncio.to_thread() for every local file read, which draws
+    # from the event loop's default ThreadPoolExecutor.  That executor defaults
+    # to min(32, cpu_count+4) = 32 threads.  With 410 workers × 32 threads =
+    # 13 000 threads attempted → RuntimeError: can't start new thread
+    # (RLIMIT_NPROC = 2048).
+    #
+    # Fix: after resetting zarr's fork-stale loop reference, pre-populate it
+    # with a fresh event loop whose executor is capped at 1 thread per worker.
+    # 410 workers × 3 threads (Python main + zarr loop + 1 I/O) = 1 230 < 2048.
+    try:
+        import atexit
+        import asyncio
+        import concurrent.futures
+        import threading
+
+        from zarr.core.sync import reset_resources_after_fork
+        reset_resources_after_fork()
+        import zarr.core.sync as _zs
+        _new_loop = asyncio.new_event_loop()
+        _new_loop.set_default_executor(
+            concurrent.futures.ThreadPoolExecutor(max_workers=1)
+        )
+        _zs.loop[0] = _new_loop
+        _io_thread = threading.Thread(target=_new_loop.run_forever, daemon=True)
+        _io_thread.start()
+        _zs.iothread[0] = _io_thread
+
+        # atexit is LIFO: our handler registered after zarr's runs first, so
+        # the loop is stopped before zarr's cleanup_resources tries to close it
+        # (closing a running loop raises RuntimeError).
+        def _stop_zarr_loop():
+            try:
+                _new_loop.call_soon_threadsafe(_new_loop.stop)
+                _io_thread.join(timeout=1)
+            except Exception:
+                pass
+
+        atexit.register(_stop_zarr_loop)
+    except Exception:
+        pass
+
     global _worker_aer_lut, _worker_gas_lut
     from aabim.data.atmospheric.atmospheric import AerLUT, GasLUT  # local import — subprocess
 
@@ -131,18 +178,17 @@ def _correction_worker(args: dict) -> None:
     y_slice = slice(row_off, row_off + height)
     x_slice = slice(col_off, col_off + width)
 
-    # --- Read window from input Zarr (via xarray for CF decoding) ---------
-    ds_in   = xr.open_zarr(args["in_path"])
-    isel    = {"y": y_slice, "x": x_slice}
-    rho_t   = np.asarray(ds_in["rho_at_sensor"].isel(**isel).values, dtype=np.float32)
+    # --- Read window from input Zarr via zarr directly (no xarray/dask in
+    # subprocesses — avoids thread-spawning and zarr v3 async interference) --
+    z_in    = zarr.open_group(args["in_path"], mode="r")
+    rho_t   = np.asarray(z_in["rho_at_sensor"][:, y_slice, x_slice], dtype=np.float32)
 
     if np.isnan(rho_t).all():
         return
 
-    sun_zen  = np.asarray(ds_in["sun_zenith"].isel(**isel).values,      dtype=np.float32)
-    view_zen = np.asarray(ds_in["view_zenith"].isel(**isel).values,     dtype=np.float32)
-    raa      = np.asarray(ds_in["relative_azimuth"].isel(**isel).values,dtype=np.float32)
-    ds_in.close()
+    sun_zen  = np.asarray(z_in["sun_zenith"][y_slice, x_slice],          dtype=np.float32)
+    view_zen = np.asarray(z_in["view_zenith"][y_slice, x_slice],         dtype=np.float32)
+    raa      = np.asarray(z_in["relative_azimuth"][y_slice, x_slice],    dtype=np.float32)
 
     valid_mask = np.isfinite(rho_t).any(axis=0)   # (height, width)
     n_pix = int(valid_mask.sum())
@@ -166,19 +212,27 @@ def _correction_worker(args: dict) -> None:
                         ones * aod550, ones * pressure, ones * z_alt])
     xi_gas = np.hstack([sun_v, view_v, raa_v,
                         ones * water, ones * ozone, ones * pressure, ones * z_alt])
+    del sun_v, view_v, raa_v, ones
 
     rho_path_v = _worker_aer_lut.interps["rho"](xi_aer)       # (n_pix, n_wl)
     t_ra_v     = _worker_aer_lut.interps["t"](xi_aer)
     s_ra_v     = _worker_aer_lut.interps["s"](xi_aer)
     sky_v      = _worker_aer_lut.interps["sky_glint"](xi_aer)
+    del xi_aer
     t_gas_v    = _worker_gas_lut.interps["t_gas"](xi_gas)
+    del xi_gas
 
-    unpack   = BaseLUT.unpack_to_spatial
+    unpack    = BaseLUT.unpack_to_spatial
     rho_path  = unpack(rho_path_v, valid_mask, n_wl)
+    del rho_path_v
     t_ra      = unpack(t_ra_v,     valid_mask, n_wl)
+    del t_ra_v
     s_ra      = unpack(s_ra_v,     valid_mask, n_wl)
+    del s_ra_v
     sky_glint = unpack(sky_v,      valid_mask, n_wl)
+    del sky_v
     t_g       = unpack(t_gas_v,    valid_mask, n_wl)
+    del t_gas_v
 
     # --- Inverse atmospheric model ----------------------------------------
     rho_tg = rho_t / t_g - rho_path
@@ -189,13 +243,13 @@ def _correction_worker(args: dict) -> None:
     rho_w = np.where(mask_water_win[np.newaxis], rho_s - sky_glint, np.nan)
 
     # --- G21 residual glint correction ------------------------------------
-    rho_f  = args["rho_f"]                                      # (n_wl,)
-    nir_i  = int(args["nir_i"])
-    ref_ratio   = rho_w[nir_i] / rho_f[nir_i]                  # (height, width)
+    rho_f    = args["rho_f"]                                     # (n_wl,)
+    nir_i    = int(args["nir_i"])
+    ref_ratio   = rho_w[nir_i] / rho_f[nir_i]                   # (height, width)
     rho_w_gl21  = rho_w - rho_f[:, None, None] * ref_ratio[None]
 
     # --- Write to output Zarr ---------------------------------------------
-    z_out = zarr.open(args["out_path"], mode="r+")
+    z_out = zarr.open_group(args["out_path"], mode="r+")
     z_out["rho_s"][:, y_slice, x_slice]      = rho_s
     z_out["rho_w"][:, y_slice, x_slice]      = rho_w
     z_out["rho_w_gl21"][:, y_slice, x_slice] = rho_w_gl21
@@ -287,7 +341,13 @@ class CorrectMixin:
     def _compute_rho_at_sensor(self, cal_model=None) -> xr.DataArray:
         """TOA reflectance from radiance_at_sensor, with optional calibration.
 
-        Returns a lazy DataArray (wavelength, y, x).
+        The image must already be clipped to the model's spectral range before
+        this is called (see callers: mask_wavelength before _compute_rho_at_sensor).
+
+        Returns
+        -------
+        rho_t : DataArray
+            Lazy (wavelength, y, x) reflectance.
         """
         wavelength = np.asarray(self.wavelength, dtype=np.float64)
         doy      = self.acq_time_z.timetuple().tm_yday
@@ -311,8 +371,11 @@ class CorrectMixin:
         rho_t = (math.pi * self.in_ds["radiance_at_sensor"]) / (f0_da * cos_sz)
 
         if cal_model is not None:
-            image_wl = xr.DataArray(wavelength, dims=["wavelength"])
+            # Round to 2 dp so float32-stored wavelengths (e.g. 374.78 stored
+            # as 374.77999878) align exactly with 2-dp CSV model coordinates.
+            image_wl = xr.DataArray(np.round(wavelength, 2), dims=["wavelength"])
             coeffs   = cal_model.coeffs.interp(wavelength=image_wl, method="linear")
+
             if cal_model.model_name == "ratio":
                 rho_t = rho_t * coeffs["gain"]
             else:
@@ -392,6 +455,10 @@ class CorrectMixin:
 
         log.info("to_l1r: computing rho_at_sensor for '%s'", self.image_name)
 
+        if cal_model is not None:
+            model_wl = cal_model.coeffs.wavelength
+            self.mask_wavelength([float(model_wl.min()), float(model_wl.max())])
+
         rho_t = self._compute_rho_at_sensor(cal_model)
         ndwi_da, mask_water_da = self._compute_water_mask(rho_t)
 
@@ -464,9 +531,41 @@ class CorrectMixin:
                 "Run add_ancillary() before to_l2r()."
             )
 
+        if cal_model is not None:
+            model_wl = cal_model.coeffs.wavelength
+            wmin, wmax = float(model_wl.min()), float(model_wl.max())
+            n_before = len(self.wavelength)
+            self.mask_wavelength([wmin, wmax])
+            n_dropped = n_before - len(self.wavelength)
+            if n_dropped:
+                log.info(
+                    "Dropped %d band(s) outside calibration range [%.2f, %.2f] nm",
+                    n_dropped, wmin, wmax,
+                )
+
+        from aabim.data.atmospheric.atmospheric import AerLUT
+        lut_wmin, lut_wmax = AerLUT.wavelength_range()
+        out_of_range = (
+            (np.asarray(self.wavelength) < lut_wmin) |
+            (np.asarray(self.wavelength) > lut_wmax)
+        )
+        if out_of_range.any():
+            log.info(
+                "Dropping %d band(s) outside LUT range [%.2f, %.2f] nm: %s",
+                int(out_of_range.sum()), lut_wmin, lut_wmax,
+                np.asarray(self.wavelength)[out_of_range].tolist(),
+            )
+            self.mask_wavelength([lut_wmin, lut_wmax])
+
         import os
         if n_workers == -1:
-            n_workers = os.cpu_count() or 1
+            try:
+                # Reads the cgroup/Slurm CPU affinity mask — returns only the
+                # cores actually allocated to this job, not all node cores.
+                n_workers = len(os.sched_getaffinity(0))
+            except AttributeError:
+                # sched_getaffinity is Linux-only; fall back on non-Linux.
+                n_workers = os.cpu_count() or 1
 
         log.info(
             "to_l2r: '%s'  backend=%s  workers=%d  window=%d",
@@ -477,8 +576,6 @@ class CorrectMixin:
         rho_t = self._compute_rho_at_sensor(cal_model)
         ndwi_da, mask_water_da = self._compute_water_mask(rho_t)
 
-        # Materialise rho_at_sensor into a temporary in-memory dataset
-        # so the input Zarr is self-contained for worker reads.
         ds_l1r = self.in_ds.assign(
             rho_at_sensor=rho_t,
             ndwi=ndwi_da,
@@ -500,57 +597,83 @@ class CorrectMixin:
         n_cols = self.n_cols
         wavelength = np.asarray(self.wavelength, dtype=np.float32)
 
-        import dask.array as da
-        nan_3d = da.full(
-            (n_wl, n_rows, n_cols), np.nan, dtype=np.float32,
-            chunks=(n_wl, window_size, window_size),
-        )
-        coords_3d = {
-            "wavelength": self.in_ds.wavelength,
-            "y": self.in_ds.y,
-            "x": self.in_ds.x,
-        }
-        _attrs3 = {"units": "1"}
+        import dask
 
-        ds_out = ds_l1r.assign(
-            rho_s     =xr.DataArray(nan_3d, dims=["wavelength","y","x"],
-                                    coords=coords_3d, attrs={**_attrs3,
-                                    "long_name": "Surface reflectance"}),
-            rho_w     =xr.DataArray(nan_3d, dims=["wavelength","y","x"],
-                                    coords=coords_3d, attrs={**_attrs3,
-                                    "long_name": "Water-leaving reflectance"}),
-            rho_w_gl21=xr.DataArray(nan_3d, dims=["wavelength","y","x"],
-                                    coords=coords_3d, attrs={**_attrs3,
-                                    "long_name": "Water-leaving reflectance (Gao & Li 2021)"}),
-        )
-        ds_out.attrs["processing_level"] = "L2R"
-        ds_out.attrs["backend"]          = backend
-        ds_out.attrs["aod_source"]       = "merra2"
-        ds_out.attrs["l2r_applied_at"]   = (
+        # Write ds_l1r (rho_at_sensor, geometry, ancillary) one chunk at a
+        # time using the synchronous Dask scheduler so CPU usage during this
+        # setup step is bounded to the main process only.
+        ds_out_base = ds_l1r.copy(deep=False)
+        ds_out_base.attrs["processing_level"] = "L2R"
+        ds_out_base.attrs["backend"]          = backend
+        ds_out_base.attrs["aod_source"]       = "merra2"
+        ds_out_base.attrs["l2r_applied_at"]   = (
             datetime.datetime.now(datetime.timezone.utc).isoformat()
         )
         if cal_model is not None:
             import json
-            ds_out.attrs["cal_model"] = json.dumps(cal_model.to_dict())
+            ds_out_base.attrs["cal_model"] = json.dumps(cal_model.to_dict())
 
-        # Write the full dataset (NaN-filled 3D arrays + everything else)
+        # Rechunk to uniform sizes before writing — zarr v3 requires the last
+        # chunk to be ≤ the first; irregular dask chunks (e.g. from mask_wavelength
+        # on a file with non-aligned native chunks) would violate this.
+        ds_out_base = ds_out_base.chunk(
+            {"wavelength": -1, "y": window_size, "x": window_size}
+        )
+
         result_tmp = copy.copy(self)
-        result_tmp.in_ds = ds_out
+        result_tmp.in_ds = ds_out_base
         result_tmp.level = "L2R"
-        result_tmp.to_zarr(output)
+        with dask.config.set(scheduler="synchronous"):
+            result_tmp.to_zarr(output)
+
+        # Add the three output arrays directly via zarr — no Dask, no RAM
+        # spike.  fill_value=np.nan means unwritten chunks read back as NaN,
+        # so workers can fill in-place without a preliminary full write.
+        z_grp = zarr.open_group(output, mode="r+")
+        _out_vars = {
+            "rho_s":      "Surface reflectance",
+            "rho_w":      "Water-leaving reflectance",
+            "rho_w_gl21": "Water-leaving reflectance (Gao & Li 2021)",
+        }
+        for vname, long_name in _out_vars.items():
+            z_grp.create_array(
+                vname,
+                shape=(n_wl, n_rows, n_cols),
+                chunks=(n_wl, window_size, window_size),
+                dtype=np.float32,
+                fill_value=np.nan,
+                overwrite=True,
+                # zarr 3.x native dimension names — read by xarray's zarr backend
+                dimension_names=["wavelength", "y", "x"],
+                attributes={
+                    "units": "1",
+                    "long_name": long_name,
+                    "grid_mapping": "spatial_ref",
+                },
+            )
+        # Consolidate so workers can look up the new arrays from .zmetadata.
+        zarr.consolidate_metadata(output)
         log.info("Output Zarr initialised → %s", output)
 
         # --- Step 4: write L1R input to a temp Zarr for workers ----------
-        import tempfile, shutil
+        import tempfile
+        import shutil
         tmp_dir = tempfile.mkdtemp(prefix="aabim_l1r_")
         in_path = str(Path(tmp_dir) / "l1r_input.zarr")
         try:
-            # Write rho_at_sensor + geometry to a temp Zarr for workers to read
+            # Write rho_at_sensor + geometry to a temp Zarr for workers to read.
+            # Rechunk to window_size so each worker read maps to exactly one
+            # zarr chunk (avoids cross-chunk I/O when source chunks != window).
+            # drop_encoding() prevents xarray from re-applying the original
+            # NetCDF scale_factor/dtype when writing to zarr, which would cause
+            # zarr.open_group (no CF decoding) to read raw int values instead
+            # of decoded float values (e.g., 33086 instead of 33.086°).
             ds_worker_in = ds_l1r[
                 ["rho_at_sensor", "sun_zenith", "view_zenith",
                  "sun_azimuth", "view_azimuth", "relative_azimuth"]
-            ]
-            ds_worker_in.to_zarr(in_path, mode="w", consolidated=True)
+            ].chunk({"wavelength": -1, "y": window_size, "x": window_size}).drop_encoding()
+            with dask.config.set(scheduler="synchronous"):
+                ds_worker_in.to_zarr(in_path, mode="w", consolidated=True)
 
             # --- Step 5: build per-window arguments ----------------------
             aod550   = float(self.in_ds["aerosol_optical_depth_at_550_nm"].values)

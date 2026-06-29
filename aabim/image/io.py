@@ -41,25 +41,37 @@ class IOMixin:
         return cls.decode_xr(in_path, in_ds)
 
     @classmethod
-    def from_aabim_nc(cls, in_path: str):
+    def from_aabim_nc(cls, in_path: str, chunk_size: int = 256):
         """Populate Image object from aabim CF NetCDF dataset
 
         Parameters
         ----------
         in_path: str
             NetcCDF (.nc) CF-1.0 compliant file to read from
+        chunk_size: int, default 256
+            Dask chunk size in y and x.  Pass the same value as
+            ``window_size`` in :meth:`to_l2r` to avoid cross-chunk reads
+            during the temp-zarr write (though ``to_l2r`` rechunks
+            automatically, so this is optional).
 
         Returns
         -------
         """
 
         if os.path.isfile(in_path):
-            in_ds = xr.open_dataset(in_path, decode_times=False)
-
-            # in_ds = netCDF4.Dataset(in_path, "r+", format="NETCDF4")
-            # image_name = os.path.basename(in_path).split(".")[0]
-            # in_ds.image_name = image_name
-            # in_ds.close()
+            in_ds = xr.open_dataset(in_path, decode_times=False, chunks={"y": chunk_size, "x": chunk_size})
+            # Round wavelength coordinate to 2 dp (float64) so that float32
+            # storage artefacts (e.g. 374.78 → 374.77999878) are corrected and
+            # wavelengths align exactly with calibration model CSV values.
+            # assign_coords returns a new Dataset and drops the file's _close
+            # callback, breaking add_ancillary's close-then-write pattern.
+            # Restore it explicitly via set_close().
+            if "wavelength" in in_ds.coords:
+                _close = in_ds._close
+                in_ds = in_ds.assign_coords(
+                    wavelength=np.round(in_ds["wavelength"].values.astype(np.float64), 2)
+                )
+                in_ds.set_close(_close)
         else:
             raise Exception(f"File {in_path} does not exist")
 
@@ -170,12 +182,12 @@ class IOMixin:
         nc_ds.createDimension("y", len(self.y))
         nc_ds.createDimension("x", len(self.x))
 
-        band_var = nc_ds.createVariable("wavelength", "f4", ("wavelength",))
+        band_var = nc_ds.createVariable("wavelength", "f8", ("wavelength",))
         band_var.units = "nm"
         band_var.standard_name = "radiation_wavelength"
         band_var.long_name = "Central wavelengths of the sensor bands"
         band_var.axis = "wavelength"
-        band_var[:] = self.wavelength
+        band_var[:] = np.round(self.wavelength, 2)
 
         # Create coordinate variables
         # We will store time as seconds since 1 january 1970 good luck people of 2038 :) !
@@ -293,6 +305,7 @@ class IOMixin:
         scale: float = 1.0,
         comp="zlib",
         complevel=1,
+        chunk_size: int = 256,
     ):
         """Create a CF-1.0 variable in a NetCDF dataset
 
@@ -333,6 +346,15 @@ class IOMixin:
         # if scale == 1.0:
         #     self.no_data = netCDF4.default_fillvals[type] - 50
 
+        # Align on-disk chunks with the 256×256 spatial tiles requested by
+        # from_aabim_nc so xarray doesn't warn about misaligned chunks.
+        if dims and "y" in dims and "x" in dims:
+            chunksizes = tuple(
+                chunk_size if d in ("y", "x") else 1 for d in dims
+            )
+        else:
+            chunksizes = None
+
         data_var = ds.createVariable(
             varname=name,
             datatype=type,
@@ -340,6 +362,7 @@ class IOMixin:
             fill_value=self.no_data,
             compression=comp,
             complevel=complevel,
+            chunksizes=chunksizes,
         )
 
         data_var.grid_mapping = "grid_mapping"  # self.proj_var.name
@@ -452,7 +475,7 @@ class IOMixin:
         ds.to_zarr(out_store, mode="w", consolidated=consolidated)
         log.info("Image written to Zarr store → %s", out_store)
 
-    def zarr_to_nc(self, zarr_path: str, nc_path: str) -> None:
+    def zarr_to_nc(self, zarr_path: str, nc_path: str, complevel: int = 3) -> None:
         """Convert a Zarr store produced by :meth:`to_zarr` to CF NetCDF.
 
         All CF metadata (``spatial_ref``, ``grid_mapping`` attributes,
@@ -465,7 +488,21 @@ class IOMixin:
             Path to the source Zarr directory store.
         nc_path : str
             Destination NetCDF file path (``*.nc``).
+        complevel : int, optional
+            zstd compression level (0 = no compression, 1 = fastest,
+            22 = smallest). Default is 3.  Requires ``hdf5plugin`` in the
+            environment (it registers the zstd filter with the shared
+            libhdf5 used by the netCDF4 engine).
         """
-        ds = xr.open_zarr(zarr_path)
-        ds.to_netcdf(nc_path)
+        import dask
+        import hdf5plugin  # noqa: F401 — registers zstd filter into shared libhdf5
+        ds = xr.open_zarr(zarr_path).drop_encoding()
+        encoding = (
+            {v: {"compression": "zstd", "complevel": complevel}
+             for v, da in ds.data_vars.items()
+             if da.ndim >= 1}
+            if complevel > 0 else {}
+        )
+        with dask.config.set(scheduler="synchronous"):
+            ds.to_netcdf(nc_path, encoding=encoding)
         log.info("Zarr → NetCDF written → %s", nc_path)

@@ -454,6 +454,17 @@ class SMAModel(CalibrationModel):
 
     model_name = "sma"
 
+    def __init__(self, wavelength, coeffs, metadata):
+        # Normalize legacy CSV column names produced by older scripts
+        rename = {}
+        if "rho_t_estimate" in coeffs and "a" not in coeffs:
+            rename["rho_t_estimate"] = "a"
+        if "intercept_estimate" in coeffs and "b" not in coeffs:
+            rename["intercept_estimate"] = "b"
+        if rename:
+            coeffs = coeffs.rename_vars(rename)
+        super().__init__(wavelength, coeffs, metadata)
+
     @classmethod
     def fit(cls, cal_data) -> "SMAModel":
         """Fit a SMA (Type-II) model.

@@ -1,464 +1,247 @@
-"""
-Script used to generate the lookup table for the atmospheric correction
-The LUT from acolite is used as a starting point:
+"""Generate the gas transmittance LUT using 6S.
 
-* 'wave' (wavelength [um], size = 82):
-    [0.34, 0.35, 0.36, 0.37, 0.38, 0.39, 0.4 , 0.41, 0.42, 0.43, 0.44, 0.45,
-    0.46, 0.47, 0.48, 0.49, 0.5 , 0.51, 0.52, 0.53, 0.54, 0.55, 0.56, 0.57,
-    0.58, 0.59, 0.6 , 0.61, 0.62, 0.63, 0.64,0.65, 0.66, 0.67, 0.68, 0.69,
-    0.7 , 0.71, 0.72, 0.73, 0.74, 0.75, 0.76, 0.77, 0.78, 0.79, 0.8 , 0.81,
-    0.82, 0.83,0.84, 0.85, 0.86, 0.87, 0.88, 0.89, 0.9 , 1., 1.1 , 1.2 , 1.3,
-    1.4, 1.5, 1.55, 1.6, 1.65, 1.7, 1.75, 1.8, 1.85, 1.9, 2., 2.05, 2.1,
-    2.15, 2.2, 2.25, 2.3, 2.35, 2.4, 2.45, 2.5]
+Calls 6S (sixs_json conda-forge package) once per grid point with user-defined
+water vapour and ozone (IDATM=8, IAER=0), collects the JSON gas-transmittance
+output, and writes a CF-compliant NetCDF.
 
-* 'azi' (relative azimuth [degree], size = 13):
-    [0., 10., 20., 40., 60., 80., 90., 100., 120., 140., 160., 170., 180.]
+Grid dimensions
+---------------
+sol_zen          : solar zenith angle [deg]
+view_zen         : sensor zenith angle [deg]
+relative_azimuth : relative azimuth (sun→sensor) [deg] — full 0–180 range
+water            : atmospheric water vapour column [g cm⁻²]
+ozone            : ozone column [atm-cm]
+target_pressure  : surface pressure at target [mbar]
+sensor_altitude  : sensor altitude above geoid [m]   (6S input: −alt/1000 km)
+wavelength       : [nm]  (passed to 6S in µm)
 
-* 'thv' (viewing zenith [degree], size = 13):
-    [0., 1.5,  4., 8., 12., 16., 24., 32., 40., 48., 56., 64., 72.]
-
-* 'ths' (sun zenith [degree], size = 16):
-    [0.,  1.5,  4.,  8., 16., 24., 32., 40., 48., 56., 60., 64., 68., 72., 76., 80.]
-
-* 'wnd' (wind speed [m s-1], size = 1):
-    2.0
-
-* 'tau' (aerosol optical depth at 550, size = 16):
-    [1.0e-03, 1.0e-02, 2.0e-02, 5.0e-02, 1.0e-01, 1.5e-01, 2.0e-01, 3.0e-01, 5.0e-01, 7.0e-01,1.0e+00, 1.3e+00, 1.6e+00, 2.0e+00, 3.0e+00, 5.0e+00]
-
-* Pressure at target [mbar] (proxy of target altitude) (size = 4):
-    As given in the aerosol filename [500., 750., 1013., 1100]
-
-
-On which 19 parameters are indexed as: surface(par, wave, azi, thv, ths, wnd, tau)
-
-* 'wl' (wavelength)
-* 'utotr' (upwelling total Rayleigh transmittance)
-* 'dtotr' (downwelling total Rayleigh transmittance)
-* 'phar' Not used
-* 'asray' (spherical albedo Rayleigh)
-* 'tray' (transmittance Rayleigh)
-* 'rorayl' (reflectance Rayleigh (6S composante I))
-* 'utota' (upwelling total aerosol transmittance)
-* 'dtota' (downwelling total aerosol transmittance)
-* 'phaa' Not used
-* 'asaer' (spherical albedo aerosol)
-* 'taer' (transmittance aerosol ?)
-* 'roaero' (reflectance aerosol (6S composante I))
-* 'utott' (upwelling total transmittance)
-* 'dtott' (downwelling total transmittance)
-* 'astot' (spherical albedo total)
-* 'romix' (path reflectance, Rayleigh + aerosol)
-* 'roc' Not used
-* 'rsurf' (surface reflectance, Fresnel ?)
-
-The water vapor LUT is generated using the following parameters:
-* 'wv':
-    [0., 0.5, 1., 1.5, 2., 2.5, 3., 3.5, 4.]
-
+Usage
+-----
+python gen_lut_gas.py --output lut_gas.nc --n-workers 400
 """
 
-import concurrent.futures
+from __future__ import annotations
+
+import argparse
 import itertools
-import os
-import subprocess
-import time
-
-import math
-
-import netCDF4
-import numpy as np
-
-# from p_tqdm import p_uimap
 import json
+import subprocess
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from pathlib import Path
+
+import numpy as np
+import xarray as xr
+from tqdm import tqdm
+
+# ---------------------------------------------------------------------------
+# Grid definition — edit here to change LUT resolution / bounds
+# ---------------------------------------------------------------------------
+
+SOL_ZEN   = [20.0, 30.0, 40.0, 50.0, 60.0, 70.0]           # deg
+VIEW_ZEN  = [0.0, 10.0, 20.0, 30.0, 40.0, 50.0]            # deg
+REL_AZI   = list(np.arange(0, 181, 10, dtype=float))  # 0–180 deg, 19 pts
+WATER     = [0.0, 1.0, 2.0, 3.0, 4.0]               # g cm⁻²
+OZONE     = [0.0, 0.25, 0.35, 0.50]                  # atm-cm
+PRESSURE  = [750.0, 1013.0]                           # mbar
+ALT_M     = [2000.0, 3000.0, 4000.0]                          # m (6S: −alt/1000 km)
+WL_NM     = list(np.round(np.arange(340, 1000, 10, dtype=float), 1))  # nm
+
+# ---------------------------------------------------------------------------
+# 6S worker
+# ---------------------------------------------------------------------------
 
 
-def format_estimated_time(estimated_time):
-    if estimated_time >= 60.0 * 60 * 24 * 365 * 100:
-        return str(estimated_time / (60.0 * 60 * 24 * 365 * 100)) + " centuries"
-    elif estimated_time >= 60.0 * 60 * 24 * 365:
-        return str(estimated_time / (60.0 * 60 * 24 * 365)) + " years"
-    elif estimated_time >= 60 * 60 * 24 * 30:
-        return str(estimated_time / (60 * 60 * 24 * 30)) + " months"
-    elif estimated_time >= 60 * 60 * 24 * 7:
-        return str(estimated_time / (60 * 60 * 24 * 7)) + " weeks"
-    elif estimated_time >= 60 * 60 * 24:
-        return str(estimated_time / (60 * 60 * 24)) + " days"
-    elif estimated_time >= 60 * 60:
-        return str(estimated_time / (60 * 60)) + " hours"
-    elif estimated_time >= 60:
-        return str(estimated_time / 60) + " minutes"
-    else:
-        return str(estimated_time) + " seconds"
+def _run_sixs(task: tuple) -> tuple[int, dict]:
+    """Run one 6S call; return (flat_index, result_dict).
 
+    Uses IDATM=8 (user H2O + O3) and IAER=0 (no aerosol) to isolate gas
+    transmittance.
+    """
+    idx, sixs_bin, sol_zen, view_zen, raa, water, ozone, pressure, alt_m, wl_nm = task
 
-def create_gas_output_nc(filename, coords, compression=None, complevel=None):
-    # Create the output netcdf file
-    nc = netCDF4.Dataset(
-        filename,
-        "w",
-        format="NETCDF4",
-    )
-    # Create the dims
+    wl_um = wl_nm / 1000.0
+    alt_km_neg = -(alt_m / 1000.0)
 
-    nc.createDimension("sol_zen", len(coords["sol_zen"]))
-    nc.createDimension("view_zen", len(coords["view_zen"]))
-    nc.createDimension("relative_azimuth", len(coords["relative_azimuth"]))
-    nc.createDimension("water", len(coords["water"]))
-    nc.createDimension("ozone", len(coords["ozone"]))
-    nc.createDimension("target_pressure", len(coords["target_pressure"]))
-    nc.createDimension("sensor_altitude", len(coords["sensor_altitude"]))
-    nc.createDimension("wavelength", len(coords["wavelength"]))
-
-    sol_zen_nc = nc.createVariable("sol_zen", "f4", ("sol_zen",))
-    sol_zen_nc.standard_name = "solar_zenith_angle"
-    sol_zen_nc.units = "degree"
-    sol_zen_nc[:] = coords["sol_zen"]
-
-    view_zen_nc = nc.createVariable("view_zen", "f4", ("view_zen",))
-    view_zen_nc.standard_name = "sensor_zenith_angle"
-    view_zen_nc.units = "degree"
-    view_zen_nc[:] = coords["view_zen"]
-
-    relative_azimuth_nc = nc.createVariable(
-        "relative_azimuth", "f4", ("relative_azimuth",)
-    )
-    relative_azimuth_nc.standard_name = (
-        "angle_of_rotation_from_solar_azimuth_to_platform_azimuth"
-    )
-    relative_azimuth_nc.long_name = "relative_azimuth_angle"
-    relative_azimuth_nc.units = "degree"
-    relative_azimuth_nc[:] = coords["relative_azimuth"]
-
-    water_nc = nc.createVariable("water", "f4", ("water",))
-    water_nc.standard_name = "atmosphere_mass_content_of_water_vapor"
-    water_nc.units = "g cm-2"
-    water_nc[:] = coords["water"]
-
-    ozone_nc = nc.createVariable("ozone", "f4", ("ozone",))
-    ozone_nc.standard_name = "equivalent_thickness_at_stp_of_atmosphere_ozone_content"
-    ozone_nc.units = "atm-cm"
-    ozone_nc[:] = coords["ozone"]
-
-    pressure_nc = nc.createVariable("target_pressure", "f4", ("target_pressure",))
-    pressure_nc.units = "mbar"
-    pressure_nc[:] = coords["target_pressure"]
-
-    altitude_nc = nc.createVariable("sensor_altitude", "f4", ("sensor_altitude",))
-    altitude_nc.standard_name = "altitude"
-    altitude_nc.units = "km"
-    altitude_nc[:] = coords["sensor_altitude"]
-
-    # Create the coordinates variables
-    wavelength_nc = nc.createVariable("wavelength", "f4", ("wavelength",))
-    wavelength_nc.standard_name = "radiation_wavelength"
-    wavelength_nc.units = "nm"
-    wavelength_nc[:] = coords["wavelength"]
-
-    # Create the data variables
-    dimensions = (
-        "sol_zen",
-        "view_zen",
-        "relative_azimuth",
-        "water",
-        "ozone",
-        "target_pressure",
-        "sensor_altitude",
-        "wavelength",
+    sixs_input = (
+        "\n"
+        "0\n"    # IGEOM user-defined
+        f"{sol_zen} 0.0 {view_zen} {raa} 1 1\n"
+        "8\n"    # IDATM user-defined H2O + O3
+        f"{water}\n"
+        f"{ozone}\n"
+        "0\n"    # IAER no aerosol
+        "-1\n"   # visibility (unused when IAER=0)
+        f"{pressure}\n"
+        f"{alt_km_neg}\n"
+        "-1.0 -1.0\n"
+        "-1.0\n"
+        "-1\n"   # IWAVE monochromatic
+        f"{wl_um}\n"
+        "0\n"    # INHOMO
+        "0\n"    # IDIREC
+        "0\n"    # IGROUN
+        "0\n"    # surface reflectance
+        "-1\n"   # IRAPP
     )
 
-    nc.createVariable(
-        "atmospheric_reflectance_at_sensor",
-        "f4",
-        dimensions,
-        compression=compression,
-        complevel=complevel,
+    proc = subprocess.run(
+        [sixs_bin], input=sixs_input, capture_output=True, text=True
     )
-    nc.createVariable(
-        "global_gas_trans_total",
-        "f4",
-        dimensions,
-        compression=compression,
-        complevel=complevel,
-    )
-
-    return nc
-
-# Function to run model and accumulate results
-def run_model_and_accumulate(
-    start,
-    end,
-    commands,
-    atmospheric_reflectance_at_sensor,
-    gas_trans_total,
-):
-    global counter  # Declare counter as global
-
-    # print(f"Running task with start={start}, end={end}")
-
-    for i in range(start, end):
-        counter += 1
-
-        command = commands[i]
-        process = subprocess.run(command, shell=True, capture_output=True)
-
-        # print(f"Subprocess exited with status {process.returncode}")
-
-        if process.stderr:
-            error_msg = process.stderr.decode("utf-8")
-            raise RuntimeError(f"Subprocess error: {error_msg}")
-
-        temp = json.loads(process.stdout)
-
-        # if math.isnan(float(temp["atmospheric_reflectance_at_sensor"])):
-        #     print("atmospheric_path_radiance is NaN ...")
-
-        atmospheric_reflectance_at_sensor[i] = float(
-            temp["atmospheric_reflectance_at_sensor"]
+    if proc.returncode != 0:
+        raise RuntimeError(
+            f"6S failed (idx={idx}, sol={sol_zen}, view={view_zen}, "
+            f"raa={raa}, H2O={water}, O3={ozone}, wl={wl_nm}): {proc.stderr[:300]}"
         )
 
-        # gas_trans_total[i] = float(temp["global_gas_trans_total"])
-        gas_trans_total[i] = float(temp["ozone_gas_trans_total"]) * float(temp["water_gas_trans_total"])
+    out = json.loads(proc.stdout)
 
-        # counter += 1
+    t_gas = (
+        float(out["ozone_gas_trans_total"])
+        * float(out["water_gas_trans_total"])
+    )
 
-    return
+    return idx, {"t_gas": t_gas}
 
 
-# Declare the global counter
-counter = 0
+# ---------------------------------------------------------------------------
+# LUT assembly
+# ---------------------------------------------------------------------------
 
-if __name__ == "__main__":
-    # Function to generate cartesian product of input
-    def cartesian_product(dimensions):
-        return list(itertools.product(*dimensions))
 
-    # TODO, run only for the 20 node wavelength of 6S ?
-    # 20 node wavelength of 6s
-    # wavelength = [
-    #     0.350,
-    #     0.400,
-    #     0.412,
-    #     0.443,
-    #     0.470,
-    #     0.488,
-    #     0.515,
-    #     0.550,
-    #     0.590,
-    #     0.633,
-    #     0.670,
-    #     0.694,
-    #     0.760,
-    #     0.860,
-    #     # 1.240,
-    #     # 1.536,
-    #     # 1.650,
-    #     # 1.950,
-    #     # 2.250,
-    #     # 3.750,
-    # ]
+def generate_gas_lut(
+    output_path: str | Path,
+    n_workers: int = -1,
+    complevel: int = 4,
+    sixs_bin: str = "sixs_json",
+    # Grid overrides — None means use the module-level defaults above
+    sol_zen: list | None = None,
+    view_zen: list | None = None,
+    rel_azi: list | None = None,
+    water: list | None = None,
+    ozone: list | None = None,
+    pressure: list | None = None,
+    alt_m: list | None = None,
+    wl_nm: list | None = None,
+) -> Path:
+    """Generate the gas transmittance LUT and write it to *output_path*.
 
-    # Define your dims here
-    # dims = [
-    #     np.arange(10, 61, 10).tolist(),  # sun zenith
-    #     np.arange(0, 31, 10).tolist(),  # view zenith
-    #     np.arange(0, 181, 10).tolist(),  # relative azimuth
-    #     [1.0, 2.0, 3.0], # H2O g/cm2
-    #     [0.3, 0.5],  # Ozone cm-atm https://gml.noaa.gov/ozwv/dobson/papers/wmobro/ozone.html
-    #     [
-    #         1.0e-3,
-    #         1.0e-2,
-    #         2.0e-2,
-    #         5.0e-2,
-    #         1.0e-1,
-    #         1.5e-1,
-    #         2.0e-1,
-    #         3.0e-1,
-    #         5.0e-1,
-    #         7.0e-1,
-    #         1.0,
-    #         1.3,
-    #         1.6,
-    #         2.0,
-    #         3.0,
-    #         5.0
-    #     ], # AOD 555
-    #     [750., 1013.],  # pressure at target mb
-    #     [-1, -3, -4],  # sensor altitude -km
-    #     np.arange(0.34, 1.1, 0.01).tolist(),  # wavelength
-    # ]
+    Parameters
+    ----------
+    output_path : destination NetCDF file
+    n_workers   : parallel threads (-1 → cpu_count)
+    complevel   : zlib compression level (0–9)
+    sixs_bin    : sixs_json binary name or path (default: "sixs_json" from PATH)
+    sol_zen … wl_nm : grid axis overrides; None → use module-level defaults.
+    """
+    import os
+    import shutil
+    import sys
 
-    dimensions = [
-        [30,40,50],
-        # np.arange(10, 61, 10).tolist(),  # sun zenith
-        np.arange(0, 31, 10).tolist(),  # view zenith
-        # np.arange(0, 181, 10).tolist(),  # relative azimuth
-        [60,70,80,90,100,110,120],
-        [0, 1.0, 2.0, 3.0], # H2O g/cm2
-        [0, 0.3, 0.5],  # Ozone cm-atm https://gml.noaa.gov/ozwv/dobson/papers/wmobro/ozone.html
-        [750., 1013.],  # pressure at target mb
-        [-3, -4],  # sensor altitude -km
-        np.arange(0.34, 1, 0.01).tolist(),  # wavelength
+    if n_workers < 1:
+        n_workers = os.cpu_count() or 4
+
+    # Resolve binary: PATH first, then same conda env as the running Python.
+    sixs_bin = shutil.which(sixs_bin) or str(Path(sys.executable).parent / "sixs_json")
+    if not Path(sixs_bin).exists():
+        raise FileNotFoundError(
+            f"sixs_json binary not found. Install with: conda install -c conda-forge sixs_json"
+        )
+
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    dims = [
+        sol_zen  if sol_zen  is not None else SOL_ZEN,
+        view_zen if view_zen is not None else VIEW_ZEN,
+        rel_azi  if rel_azi  is not None else REL_AZI,
+        water    if water    is not None else WATER,
+        ozone    if ozone    is not None else OZONE,
+        pressure if pressure is not None else PRESSURE,
+        alt_m    if alt_m    is not None else ALT_M,
+        wl_nm    if wl_nm    is not None else WL_NM,
+    ]
+    dim_names = ["sol_zen", "view_zen", "relative_azimuth",
+                 "water", "ozone", "target_pressure", "sensor_altitude", "wavelength"]
+    shape = [len(d) for d in dims]
+    n_total = 1
+    for s in shape:
+        n_total *= s
+
+    buf_tgas = np.full(n_total, np.nan, dtype=np.float32)
+
+    tasks = [
+        (i, sixs_bin, *combo)
+        for i, combo in enumerate(itertools.product(*dims))
     ]
 
-    # Test dimension
-    # dims = [
-    #     np.arange(30, 31, 10).tolist(),  # sun zenith
-    #     np.arange(0, 10, 10).tolist(),  # view zenith
-    #     np.arange(80, 81, 10).tolist(),  # relative azimuth
-    #     [
-    #         1.0,
-    #     ],  # [0.0, 0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 3.5, 4.0],  # H2O g/cm2
-    #     [
-    #         0.3,
-    #     ],  # Ozone cm-atm https://gml.noaa.gov/ozwv/dobson/papers/wmobro/ozone.html
-    #     [0.05],
-    #     [750.0],  # pressure at target mb
-    #     [-3],  # sensor altitude -km
-    #     np.arange(0.34, 0.36, 0.01).tolist(),  # wavelength
-    # ]
+    print(f"Gas LUT: {n_total:,} calls, {n_workers} threads")
 
-    combination = cartesian_product(dimensions)
+    with ThreadPoolExecutor(max_workers=n_workers) as pool:
+        futs = {pool.submit(_run_sixs, t): t[0] for t in tasks}
+        for fut in tqdm(as_completed(futs), total=n_total, desc="GasLUT"):
+            idx, res = fut.result()
+            buf_tgas[idx] = res["t_gas"]
 
-    print("number of combination: ", len(combination))
+    coords = {n: np.array(d, dtype=np.float32)
+              for n, d in zip(dim_names, dims)}
 
-    atmospheric_reflectance_at_sensor = [0] * len(combination)
-    gas_trans_total = [0] * len(combination)
+    ds = xr.Dataset(
+        {
+            "global_gas_trans_total": (
+                dim_names, buf_tgas.reshape(shape)
+            ),
+        },
+        coords=coords,
+    )
 
-    # Create commands
-    commands = []
-    for i in range(len(combination)):
-        command = (
-            'echo "\n0 # IGEOM\n'
-            + f"{combination[i][0]} 0.0 {combination[i][1]} {combination[i][2]} 1 1 #sun_zenith sun_azimuth view_zenith view_azimuth month day\n"
-            + "8 # IDATM\n"
-            + f"{combination[i][3]}\n"
-            + f"{combination[i][4]}\n"
-            + "0 # IAER\n"
-            + f"-1 # visibility\n"
-            + f"{combination[i][5]} # XPS pressure at target\n"
-            + f"{combination[i][6]} # XPP sensor altitude\n"
-            + "-1.0 -1.0 # UH20 UO3 below sensor\n"
-            + "-1.0 # taer550 below sensor\n"
-            + "-1 # IWAVE monochromatic\n"
-            + f"{combination[i][7]} # wavelength\n"
-            + "0 # INHOMO\n"
-            + "0 # IDIREC\n"
-            + "0 # IGROUN 0 = rho\n"
-            + "0 # surface reflectance\n"
-            + '-1 # IRAPP no atmospheric correction\n" | /home/raphael/PycharmProjects/reverie/reverie/6S/6sV2.1/sixsV2.1-json'
-        )
-        commands.append(command)
+    ds["sol_zen"].attrs.update(
+        standard_name="solar_zenith_angle", units="degree")
+    ds["view_zen"].attrs.update(
+        standard_name="sensor_zenith_angle", units="degree")
+    ds["relative_azimuth"].attrs.update(
+        standard_name="angle_of_rotation_from_solar_azimuth_to_platform_azimuth",
+        long_name="relative_azimuth_angle", units="degree")
+    ds["water"].attrs.update(
+        standard_name="atmosphere_mass_content_of_water_vapor", units="g cm-2")
+    ds["ozone"].attrs.update(
+        standard_name="equivalent_thickness_at_stp_of_atmosphere_ozone_content",
+        units="atm-cm")
+    ds["target_pressure"].attrs.update(units="mbar")
+    ds["sensor_altitude"].attrs.update(
+        standard_name="altitude",
+        long_name="sensor altitude above geoid, positive upward",
+        units="m")
+    ds["wavelength"].attrs.update(
+        standard_name="radiation_wavelength", units="nm")
 
-    lut_dir = "/home/raphael/PycharmProjects/reverie/reverie/data/lut"
+    enc = {"global_gas_trans_total": {"zlib": True, "complevel": complevel}}
+    ds.to_netcdf(output_path, encoding=enc)
+    print(f"Written → {output_path}")
+    return output_path
 
-    output_dir = os.path.join(lut_dir, "output")
 
-    if not os.path.exists(output_dir):
-        os.mkdir(output_dir)
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
 
-    # Determine the number of workers to use
-    num_workers = os.cpu_count() -2
+def _parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(description=__doc__)
+    p.add_argument("--output",    default="lut_gas.nc",
+                   help="Output NetCDF path (default: lut_gas.nc)")
+    p.add_argument("--n-workers", type=int, default=-1,
+                   help="Parallel threads (-1 = cpu_count)")
+    p.add_argument("--complevel", type=int, default=4,
+                   help="zlib compression level 0-9 (default: 4)")
+    p.add_argument("--sixs",      default="sixs_json",
+                   help="sixs_json binary name or path (default: sixs_json)")
+    return p.parse_args()
 
-    print(f"Running on {num_workers} threads")
 
-    # Calculate the number of iterations per worker
-    iterations_per_worker = len(combination) // num_workers
-
-    print(f"{iterations_per_worker} iteration per worker")
-
-    start_time = time.perf_counter()
-
-    # Create a ThreadPoolExecutor
-    with concurrent.futures.ThreadPoolExecutor(max_workers=num_workers) as executor:
-        # Start each worker
-        futures = []
-        for i in range(num_workers):
-            # Calculate the start and end indices for this worker
-            start = i * iterations_per_worker
-            end = (
-                start + iterations_per_worker
-                if i != num_workers - 1
-                else len(combination)
-            )
-
-            # Start the worker
-            futures.append(
-                executor.submit(
-                    run_model_and_accumulate,
-                    start,
-                    end,
-                    commands,
-                    atmospheric_reflectance_at_sensor,
-                    gas_trans_total,
-                )
-            )
-
-        # Iterate over the Future objects as they complete
-        # Allow to avoid the global counter object
-        # for future in concurrent.futures.as_completed(futures):
-        #     # The result of the Future is the return value of the function
-        #     result = future.result()
-        #
-        #     # Increment the counter
-        #     counter += 1
-        #
-        #     # Print the progress
-        #     print(f"Completed {counter} out of {len(combination)} tasks")
-
-        while counter < len(combination):
-            time.sleep(1)  # Sleep for a second
-
-            now = time.perf_counter()
-            elapsed = now - start_time
-
-            if elapsed > 0:  # To avoid division by zero
-                print(f"\r({counter}/{len(combination)}) | ", end="")
-
-                iterations_per_second = counter / elapsed
-                print(f"Iterations per second: {iterations_per_second}", end="")
-
-                estimated_total_time = (
-                    len(combination) - counter
-                ) / iterations_per_second
-                print(
-                    f" | Estimated time upon completion: {format_estimated_time(estimated_total_time)}",
-                    end="",
-                    flush=True,
-                )
-
-        # Wait for all workers to finish
-        concurrent.futures.wait(futures)
-
-        now = time.perf_counter()
-        elapsed = now - start_time
-        print(f"Time elapsed: {elapsed}")
-
-        coords = {
-            "sol_zen": dimensions[0],
-            "view_zen": dimensions[1],
-            "relative_azimuth": dimensions[2],
-            "water": dimensions[3],
-            "ozone": dimensions[4],
-            "target_pressure": dimensions[5],
-            "sensor_altitude": dimensions[6],
-            "wavelength": dimensions[7],
-        }
-
-    nc = create_gas_output_nc(os.path.join(output_dir, "lut_gas.nc"), coords)
-
-    # Get the shape of the dims
-    shape = [len(dimension) for dimension in dimensions]
-
-    atmospheric_reflectance_at_sensor = np.reshape(atmospheric_reflectance_at_sensor, shape)
-    gas_trans_total = np.reshape(gas_trans_total, shape)
-
-    # Write the results to the file
-    nc.variables["atmospheric_reflectance_at_sensor"][
-        :, :, :, :, :, :, :, :
-    ] = atmospheric_reflectance_at_sensor
-    nc.variables["global_gas_trans_total"][
-    :, :, :, :, :, :, :, :
-    ] = gas_trans_total
-
-    nc.close()
+if __name__ == "__main__":
+    args = _parse_args()
+    generate_gas_lut(
+        output_path=args.output,
+        n_workers=args.n_workers,
+        complevel=args.complevel,
+        sixs_bin=args.sixs,
+    )
